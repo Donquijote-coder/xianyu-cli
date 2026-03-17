@@ -3,8 +3,18 @@
 from __future__ import annotations
 
 GOOFISH_ITEM_URL = "https://www.goofish.com/item?id={item_id}"
+GOOFISH_H5_URL = "https://h5.m.goofish.com/item?id={item_id}"
 
 
 def item_url(item_id: str) -> str:
     """Build a Goofish item URL from an item ID."""
     return GOOFISH_ITEM_URL.format(item_id=item_id)
+
+
+def share_url(item_id: str) -> str:
+    """Build a mobile-friendly Goofish share URL.
+
+    Uses ``h5.m.goofish.com`` which serves a mobile-optimised H5 page
+    and is reliably clickable in messaging apps.
+    """
+    return GOOFISH_H5_URL.format(item_id=item_id)

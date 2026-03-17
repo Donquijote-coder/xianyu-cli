@@ -9,6 +9,7 @@ import click
 from xianyu_cli.core.api_client import TokenExpiredError
 from xianyu_cli.core.llm import analyze_replies
 from xianyu_cli.core.session import enrich_seller_credit, run_api_call
+from xianyu_cli.core.share import fetch_share_link
 from xianyu_cli.models.envelope import fail, ok
 from xianyu_cli.models.item import parse_search_items
 from xianyu_cli.utils._common import console
@@ -186,7 +187,7 @@ async def _run_agent_flow(
     )
 
     # --- Step 1: Search + credit sort + top N ---
-    console.print(f"[cyan]Step 1/4[/cyan] 搜索 \"{keyword}\"...")
+    console.print(f"[cyan]Step 1/5[/cyan] 搜索 \"{keyword}\"...")
     search_data: dict = {"keyword": keyword, "pageNumber": 1, "pageSize": 20}
     if min_price is not None:
         search_data["startPrice"] = str(int(min_price * 100))
@@ -231,7 +232,7 @@ async def _run_agent_flow(
 
     try:
         # --- Step 2: Broadcast inquiry ---
-        console.print(f"[cyan]Step 2/4[/cyan] 群发询价给 {len(item_ids)} 个卖家...")
+        console.print(f"[cyan]Step 2/5[/cyan] 群发询价给 {len(item_ids)} 个卖家...")
         broadcast_result = await _broadcast_message(
             cred, item_ids, inquiry, delay, ws=ws,
         )
@@ -264,7 +265,7 @@ async def _run_agent_flow(
 
         # --- Step 3: Collect replies (same WS — no gap) ---
         console.print(
-            f"[cyan]Step 3/4[/cyan] 等待卖家回复（最长 {timeout}s）..."
+            f"[cyan]Step 3/5[/cyan] 等待卖家回复（最长 {timeout}s）..."
         )
         collect_result = await _collect_replies(
             cred, sent_seller_ids, timeout, ws=ws,
@@ -280,11 +281,22 @@ async def _run_agent_flow(
     )
 
     # --- Step 4: AI Analysis ---
-    console.print("[cyan]Step 4/4[/cyan] AI 分析中...")
+    console.print("[cyan]Step 4/5[/cyan] AI 分析中...")
     analysis = await analyze_replies(
         keyword, inquiry, sellers_info, collect_result.get("replies", [])
     )
     console.print(f"[dim]  分析方式: {analysis.get('method', '?')}[/dim]")
+
+    # --- Step 5: Fetch share link for recommended item ---
+    recommended_id = analysis.get("recommended_item_id", "").strip()
+    if recommended_id and recommended_id.isdigit():
+        console.print("[cyan]Step 5/5[/cyan] 获取分享链接...")
+        share_link = await fetch_share_link(cred, recommended_id)
+        analysis["recommended_item_url"] = share_link
+        console.print(f"[dim]  分享链接: {share_link}[/dim]")
+    else:
+        console.print("[cyan]Step 5/5[/cyan] 跳过（无推荐商品）")
+    analysis.setdefault("recommended_item_url", "")
 
     return {
         "keyword": keyword,
