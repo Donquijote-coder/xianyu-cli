@@ -1,0 +1,461 @@
+"""Three-tier authentication manager.
+
+Tier 1: Load saved credentials from ~/.config/xianyu-cli/credential.json
+Tier 2: Extract cookies from browsers via browser-cookie3
+Tier 3: QR code terminal login with polling
+"""
+
+from __future__ import annotations
+
+import asyncio
+import base64
+import io
+import json
+import logging
+import re
+import time
+from random import random
+
+import httpx
+import qrcode
+from rich.live import Live
+from rich.text import Text
+
+from xianyu_cli.utils._common import APP_KEY, console
+from xianyu_cli.utils.anti_detect import DEFAULT_HEADERS
+from xianyu_cli.utils.cookie import extract_browser_cookies
+from xianyu_cli.utils.credential import (
+    Credential,
+    delete_credential,
+    load_credential,
+    save_credential,
+)
+
+logger = logging.getLogger(__name__)
+
+# QR login endpoints
+_QR_M_H5_TK_URL = (
+    "https://h5api.m.goofish.com/h5/"
+    "mtop.gaia.nodejs.gaia.idle.data.gw.v2.index.get/1.0/"
+)
+_QR_LOGIN_PAGE_URL = "https://passport.goofish.com/mini_login.htm"
+_QR_GENERATE_URL = "https://passport.goofish.com/newlogin/qrcode/generate.do"
+_QR_QUERY_URL = "https://passport.goofish.com/newlogin/qrcode/query.do"
+
+# QR polling config
+_QR_POLL_INTERVAL = 0.8  # seconds
+_QR_TIMEOUT = 300  # 5 minutes
+
+
+def _collect_set_cookies(resp: httpx.Response, target: dict[str, str]) -> None:
+    """Parse Set-Cookie headers from response into target dict.
+
+    httpx's resp.cookies doesn't capture cookies when we bypass the
+    cookie jar by sending cookies via the Cookie header. This function
+    parses the raw Set-Cookie headers directly.
+    """
+    # First try httpx's cookie jar (works when cookies param is used)
+    for k, v in resp.cookies.items():
+        target[k] = v
+    # Also parse raw Set-Cookie headers (works when Cookie header is used)
+    for raw in resp.headers.get_list("set-cookie"):
+        if "=" in raw:
+            name_value = raw.split(";")[0]
+            name, _, value = name_value.partition("=")
+            name = name.strip()
+            value = value.strip()
+            if name and value:
+                target[name] = value
+
+
+class AuthManager:
+    """Manages authentication with three-tier fallback."""
+
+    def __init__(self, ttl_hours: int = 24):
+        self.ttl_hours = ttl_hours
+
+    def get_credential(self) -> Credential | None:
+        """Try to get a valid credential via the three-tier fallback.
+
+        Returns a Credential or None. Does NOT do QR login
+        (that requires async + user interaction).
+        """
+        # Tier 1: saved credentials
+        cred = load_credential()
+        if cred and not cred.is_expired(self.ttl_hours):
+            logger.info("Using saved credential (source=%s)", cred.source)
+            return cred
+        if cred:
+            logger.info("Saved credential expired")
+
+        # Tier 2: browser cookies
+        cookies = extract_browser_cookies()
+        if cookies:
+            cred = Credential(cookies=cookies, source="browser")
+            save_credential(cred)
+            logger.info("Extracted cookies from browser")
+            return cred
+
+        # Tier 3 requires async QR login — caller must use qr_login()
+        return None
+
+    async def qr_login(self) -> Credential | None:
+        """Perform QR code terminal login.
+
+        Returns:
+            Credential on success, None on failure/timeout.
+        """
+        async with httpx.AsyncClient(
+            follow_redirects=True,
+            timeout=30.0,
+            headers=dict(DEFAULT_HEADERS),
+        ) as client:
+            # Step 1: Get initial cookies
+            console.print("[dim]正在初始化登录会话...[/dim]")
+            session_cookies: dict[str, str] = {}
+
+            resp = await client.get(_QR_M_H5_TK_URL)
+            for k, v in resp.cookies.items():
+                session_cookies[k] = v
+
+            # Step 2: Get login page parameters (also collects important cookies)
+            login_params = await self._get_login_params(client, session_cookies)
+            if not login_params:
+                console.print("[red]获取登录参数失败[/red]")
+                return None
+
+            # Step 3: Generate QR code (returns content URL + t/ck for polling)
+            qr_data = await self._generate_qr(client, login_params)
+            if not qr_data:
+                console.print("[red]生成二维码失败[/red]")
+                return None
+
+            qr_content = qr_data["codeContent"]
+
+            # Merge t and ck from QR generation into login_params for polling
+            login_params["t"] = str(qr_data.get("t", ""))
+            login_params["ck"] = qr_data.get("ck", "")
+
+            # Render QR code in terminal
+            self._render_qr(qr_content)
+            console.print("[cyan]请使用闲鱼 App 扫描上方二维码登录[/cyan]")
+            console.print("[dim]等待扫码中... (5分钟超时)[/dim]")
+
+            # Step 4: Poll for scan confirmation
+            result_cookies = await self._poll_qr_status(
+                client, login_params, session_cookies
+            )
+            if not result_cookies:
+                return None
+
+            # Merge all cookies
+            session_cookies.update(result_cookies)
+
+            # Step 5: Refresh m_h5_tk using a FRESH client
+            # The existing client's cookie jar interferes with manual Cookie
+            # headers, so we create a new client specifically for token refresh.
+            console.print("[dim]正在获取 API token...[/dim]")
+            await self._refresh_m_h5_tk(session_cookies)
+
+            if "_m_h5_tk" not in session_cookies:
+                console.print(
+                    "[yellow]警告: 未能获取 m_h5_tk token，"
+                    "首次 API 调用时将自动尝试刷新[/yellow]"
+                )
+            else:
+                console.print("[dim]API token 获取成功[/dim]")
+
+            # Build credential
+            user_id = session_cookies.get("unb", "")
+            cred = Credential(
+                cookies=session_cookies,
+                user_id=user_id,
+                source="qr-login",
+            )
+            save_credential(cred)
+            console.print(f"[green]登录成功！用户ID: {user_id}[/green]")
+            return cred
+
+    async def qr_login_json(self) -> dict:
+        """Perform QR code login, yielding JSON-friendly status dicts.
+
+        Returns a dict with either:
+          - {"status": "waiting", "qr_url": ..., "qr_image_base64": ...}
+            followed by polling until
+          - {"status": "confirmed", "user_id": ...}
+          or an error status.
+
+        This method blocks until login completes or times out.
+        """
+        async with httpx.AsyncClient(
+            follow_redirects=True,
+            timeout=30.0,
+            headers=dict(DEFAULT_HEADERS),
+        ) as client:
+            session_cookies: dict[str, str] = {}
+            resp = await client.get(_QR_M_H5_TK_URL)
+            for k, v in resp.cookies.items():
+                session_cookies[k] = v
+
+            login_params = await self._get_login_params(client, session_cookies)
+            if not login_params:
+                return {"status": "error", "message": "获取登录参数失败"}
+
+            qr_data = await self._generate_qr(client, login_params)
+            if not qr_data:
+                return {"status": "error", "message": "生成二维码失败"}
+
+            qr_content = qr_data["codeContent"]
+            login_params["t"] = str(qr_data.get("t", ""))
+            login_params["ck"] = qr_data.get("ck", "")
+
+            # Generate QR image as base64 PNG
+            qr_image_b64 = self._qr_to_base64(qr_content)
+
+            # Emit QR data to stdout for agent consumption
+            from xianyu_cli.models.envelope import ok
+            ok({
+                "status": "waiting",
+                "qr_url": qr_content,
+                "qr_image_base64": qr_image_b64,
+            }).emit("json")
+
+            # Poll for scan
+            result_cookies = await self._poll_qr_status(
+                client, login_params, session_cookies
+            )
+            if not result_cookies:
+                return {"status": "expired", "message": "登录超时或已取消"}
+
+            session_cookies.update(result_cookies)
+            await self._refresh_m_h5_tk(session_cookies)
+
+            user_id = session_cookies.get("unb", "")
+            cred = Credential(
+                cookies=session_cookies,
+                user_id=user_id,
+                source="qr-login",
+            )
+            save_credential(cred)
+            return {"status": "confirmed", "user_id": user_id}
+
+    @staticmethod
+    def _qr_to_base64(content: str) -> str:
+        """Generate a QR code PNG and return it as a base64 string."""
+        qr = qrcode.QRCode(
+            version=1,
+            error_correction=qrcode.constants.ERROR_CORRECT_L,
+            box_size=10,
+            border=2,
+        )
+        qr.add_data(content)
+        qr.make(fit=True)
+
+        img = qr.make_image(fill_color="black", back_color="white")
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        return base64.b64encode(buf.getvalue()).decode("ascii")
+
+    async def _get_login_params(
+        self,
+        client: httpx.AsyncClient,
+        cookies: dict[str, str],
+    ) -> dict[str, str] | None:
+        """Fetch login page and extract viewData parameters."""
+        params = {
+            "lang": "zh_cn",
+            "appName": "xianyu",
+            "appEntrance": "web",
+            "styleType": "vertical",
+            "bizParams": "",
+            "notLoadSsoView": "false",
+            "notKeepLogin": "false",
+            "isMobile": "false",
+            "qrCodeFirst": "false",
+            "site": "77",
+            "rnd": str(random()),
+        }
+
+        resp = await client.get(_QR_LOGIN_PAGE_URL, params=params, cookies=cookies)
+
+        # Collect cookies from login page (XSRF-TOKEN, _tb_token_, etc.)
+        for k, v in resp.cookies.items():
+            cookies[k] = v
+
+        # Extract viewData from the HTML
+        pattern = r"window\.viewData\s*=\s*(\{.*?\});"
+        match = re.search(pattern, resp.text, re.DOTALL)
+        if not match:
+            logger.error("Failed to extract viewData from login page")
+            return None
+
+        try:
+            view_data = json.loads(match.group(1))
+            form_data = view_data.get("loginFormData", {})
+            if form_data:
+                form_data["umidTag"] = "SERVER"
+                return form_data
+        except json.JSONDecodeError:
+            logger.error("Failed to parse viewData JSON")
+
+        return None
+
+    async def _generate_qr(
+        self,
+        client: httpx.AsyncClient,
+        login_params: dict[str, str],
+    ) -> dict | None:
+        """Request QR code generation and return the full data dict.
+
+        Returns dict with keys: codeContent, t, ck, resultCode, processFinished
+        """
+        resp = await client.get(_QR_GENERATE_URL, params=login_params)
+        body = resp.json()
+
+        content = body.get("content", {})
+        if content.get("success"):
+            return content["data"]
+
+        logger.error("QR generation failed: %s", body)
+        return None
+
+    async def _poll_qr_status(
+        self,
+        client: httpx.AsyncClient,
+        login_params: dict[str, str],
+        cookies: dict[str, str],
+    ) -> dict[str, str] | None:
+        """Poll QR code status until confirmed, expired, or timeout."""
+        start = time.time()
+        scanned = False
+
+        while time.time() - start < _QR_TIMEOUT:
+            await asyncio.sleep(_QR_POLL_INTERVAL)
+
+            resp = await client.post(
+                _QR_QUERY_URL,
+                data=login_params,
+                cookies=cookies,
+            )
+
+            # Handle non-JSON responses gracefully
+            try:
+                body = resp.json()
+            except Exception:
+                logger.debug("QR poll non-JSON response: %s", resp.text[:200])
+                continue
+
+            status = body.get("content", {}).get("data", {}).get("qrCodeStatus", "")
+
+            if status == "NEW":
+                pass  # Still waiting for scan
+            elif status == "SCANED" and not scanned:
+                scanned = True
+                console.print("[yellow]已扫码，请在手机上确认登录[/yellow]")
+            elif status == "CONFIRMED":
+                # Extract cookies from response (use both methods)
+                result_cookies: dict[str, str] = {}
+                _collect_set_cookies(resp, result_cookies)
+
+                # Also check response data for tokens
+                data = body.get("content", {}).get("data", {})
+                if "token" in data:
+                    result_cookies["token"] = data["token"]
+
+                logger.debug("CONFIRMED cookies: %s", list(result_cookies.keys()))
+                return result_cookies
+            elif status == "EXPIRED":
+                console.print("[red]二维码已过期，请重新登录[/red]")
+                return None
+            elif status == "CANCELLED":
+                console.print("[red]登录已取消[/red]")
+                return None
+
+            # Check for risk control (slider verification)
+            if body.get("content", {}).get("data", {}).get("iframeRedirect"):
+                redirect_url = body["content"]["data"].get("iframeRedirectUrl", "")
+                console.print("[red]需要风控验证，请在浏览器中完成验证后重试[/red]")
+                if redirect_url:
+                    console.print(f"[yellow]验证链接: {redirect_url}[/yellow]")
+                console.print("[dim]验证后可使用 xianyu login --cookie-source chrome 登录[/dim]")
+                return None
+
+        console.print("[red]登录超时（5分钟），请重试[/red]")
+        return None
+
+    @staticmethod
+    async def _refresh_m_h5_tk(cookies: dict[str, str]) -> None:
+        """Refresh _m_h5_tk by visiting h5api with a fresh HTTP client.
+
+        Uses a brand-new client to avoid cookie jar interference from the
+        QR login session. Tries multiple URLs and includes mtop query
+        parameters that the server may require to issue _m_h5_tk.
+        """
+        cookie_header = "; ".join(f"{k}={v}" for k, v in cookies.items())
+        headers = {
+            **dict(DEFAULT_HEADERS),
+            "Cookie": cookie_header,
+            "Referer": "https://www.goofish.com/",
+        }
+
+        # mtop gateway expects at least these params to respond properly
+        mtop_params = {
+            "jsv": "2.7.2",
+            "appKey": APP_KEY,
+            "type": "originaljson",
+            "dataType": "json",
+        }
+
+        refresh_urls = [
+            _QR_M_H5_TK_URL,
+            "https://www.goofish.com/",
+            _QR_M_H5_TK_URL,
+        ]
+
+        async with httpx.AsyncClient(
+            follow_redirects=True,
+            timeout=15.0,
+        ) as fresh_client:
+            for url in refresh_urls:
+                if "_m_h5_tk" in cookies:
+                    break
+                try:
+                    params = mtop_params if "h5api" in url else None
+                    resp = await fresh_client.get(
+                        url, headers=headers, params=params
+                    )
+                    _collect_set_cookies(resp, cookies)
+                    # Update cookie header for next attempt
+                    headers["Cookie"] = "; ".join(
+                        f"{k}={v}" for k, v in cookies.items()
+                    )
+                    logger.debug(
+                        "Refresh %s: _m_h5_tk=%s, cookie_count=%d",
+                        url[:40],
+                        "_m_h5_tk" in cookies,
+                        len(cookies),
+                    )
+                except Exception:
+                    logger.debug("Refresh failed for %s", url, exc_info=True)
+
+    @staticmethod
+    def _render_qr(content: str) -> None:
+        """Render QR code in the terminal using Unicode half-blocks."""
+        qr = qrcode.QRCode(
+            version=1,
+            error_correction=qrcode.constants.ERROR_CORRECT_L,
+            box_size=1,
+            border=2,
+        )
+        qr.add_data(content)
+        qr.make(fit=True)
+
+        # Use the terminal-friendly print
+        console.print()
+        qr.print_ascii(out=__import__("sys").stderr)
+        console.print()
+
+    @staticmethod
+    def logout() -> bool:
+        """Delete saved credentials."""
+        return delete_credential()
