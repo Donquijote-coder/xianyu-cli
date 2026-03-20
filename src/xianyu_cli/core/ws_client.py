@@ -15,6 +15,7 @@ import time
 import uuid
 from typing import Any, Callable
 
+import msgpack
 import websockets
 
 from xianyu_cli.core.crypto import decrypt_message
@@ -395,28 +396,38 @@ class GoofishWebSocket:
     async def watch(
         self,
         on_message: Callable[[dict[str, Any]], None] | None = None,
+        timeout: int = 180,
     ) -> None:
         """Watch for incoming messages in real-time.
 
         Args:
             on_message: Callback invoked with parsed message dict for each new message.
+            timeout: Maximum seconds to watch before auto-stopping. Default 180 (3 min).
         """
         assert self._ws is not None
         self._running = True
+        start = asyncio.get_event_loop().time()
 
         # Start heartbeat task
         heartbeat_task = asyncio.create_task(self._heartbeat_loop())
 
         try:
             while self._running:
+                elapsed = asyncio.get_event_loop().time() - start
+                if elapsed >= timeout:
+                    logger.info("Watch timeout reached (%ds), stopping", timeout)
+                    break
+
+                remaining = timeout - elapsed
+                recv_timeout = min(30, remaining)
                 try:
-                    raw = await asyncio.wait_for(self._ws.recv(), timeout=30)
+                    raw = await asyncio.wait_for(self._ws.recv(), timeout=recv_timeout)
                 except asyncio.TimeoutError:
                     continue
 
-                parsed = self._parse_push_message(raw)
-                if parsed and on_message:
-                    on_message(parsed)
+                for parsed in self._parse_push_messages(raw):
+                    if on_message:
+                        on_message(parsed)
 
         except websockets.exceptions.ConnectionClosed:
             logger.info("WebSocket connection closed")
@@ -442,40 +453,181 @@ class GoofishWebSocket:
                 logger.debug("Heartbeat failed", exc_info=True)
                 break
 
-    def _parse_push_message(self, raw: str | bytes) -> dict[str, Any] | None:
-        """Parse an incoming WebSocket message."""
+    @staticmethod
+    def _decode_spp_item(item: dict[str, Any]) -> dict[str, Any] | None:
+        """Decode a single syncPushPackage data item into a normalised message.
+
+        Returns a dict with ``senderId``, ``senderNick``, ``content``, ``contentType``,
+        ``gmtCreate`` — or ``None`` if the item is not a chat message.
+        """
+        raw_data = item.get("data", "")
+        if not raw_data:
+            return None
+
+        biz = item.get("bizType", 0)
+        obj = item.get("objectType", 0)
+
+        # --- biz=40 obj=40000 → chat message (msgpack with numeric keys) ---
+        if biz == 40 and obj == 40000:
+            try:
+                raw_bytes = base64.b64decode(raw_data)
+                unpacked = msgpack.unpackb(raw_bytes, raw=False, strict_map_key=False)
+            except Exception:
+                return None
+
+            msg = unpacked.get("1") or unpacked.get(1)
+            if not isinstance(msg, dict):
+                return None
+
+            # sender uid: msg["1"]["1"] → "657462610@goofish"
+            sender_wrap = msg.get("1") or msg.get(1, {})
+            sender_uid_raw = ""
+            if isinstance(sender_wrap, dict):
+                sender_uid_raw = sender_wrap.get("1") or sender_wrap.get(1, "")
+            elif isinstance(sender_wrap, str):
+                sender_uid_raw = sender_wrap
+
+            # extensions map: msg["10"]
+            ext = msg.get("10") or msg.get(10, {})
+            if not isinstance(ext, dict):
+                ext = {}
+
+            sender_id = ext.get("senderUserId", "")
+            if not sender_id and sender_uid_raw:
+                sender_id = str(sender_uid_raw).split("@")[0]
+
+            sender_nick = ext.get("reminderTitle", "")
+
+            # content: msg["6"]["3"]
+            content_wrap = msg.get("6") or msg.get(6, {})
+            if isinstance(content_wrap, dict):
+                inner = content_wrap.get("3") or content_wrap.get(3, {})
+            else:
+                inner = {}
+            if not isinstance(inner, dict):
+                inner = {}
+
+            text_preview = inner.get("2") or inner.get(2, "")
+            content_type = inner.get("4") or inner.get(4, 0)
+            full_json_str = inner.get("5") or inner.get(5, "")
+
+            # Extract text from full JSON content when available
+            content = text_preview
+            if full_json_str and isinstance(full_json_str, str):
+                try:
+                    cj = json.loads(full_json_str)
+                    ct = cj.get("contentType", 0)
+                    if ct == 1:
+                        content = cj.get("text", {}).get("text", text_preview)
+                except (json.JSONDecodeError, AttributeError):
+                    pass
+
+            # timestamp: msg["5"]
+            gmt_create = msg.get("5") or msg.get(5, 0)
+
+            if not sender_id:
+                return None
+
+            return {
+                "senderId": sender_id,
+                "senderNick": sender_nick,
+                "content": content,
+                "contentType": content_type,
+                "gmtCreate": gmt_create,
+            }
+
+        # --- biz=370 obj=370000 → session arouse / system (base64 JSON) ---
+        if biz == 370:
+            try:
+                raw_bytes = base64.b64decode(raw_data)
+                parsed = json.loads(raw_bytes.decode("utf-8"))
+            except Exception:
+                return None
+
+            op = parsed.get("operation", {})
+            content_obj = op.get("content", {})
+            ct = content_obj.get("contentType", -1)
+
+            # contentType=1 → actual text message
+            if ct == 1:
+                text = content_obj.get("text", {}).get("text", "")
+                sender = op.get("senderUid", "")
+                return {
+                    "senderId": sender,
+                    "senderNick": "",
+                    "content": text,
+                    "contentType": ct,
+                    "gmtCreate": 0,
+                }
+
+        return None
+
+    def _parse_push_messages(self, raw: str | bytes) -> list[dict[str, Any]]:
+        """Parse an incoming WebSocket frame into a list of chat messages.
+
+        Handles both ``syncPushPackage`` batches and legacy single-message
+        pushes.  Returns an empty list when no chat messages are found.
+        """
         if isinstance(raw, bytes):
             try:
                 raw = raw.decode("utf-8")
             except UnicodeDecodeError:
-                return None
+                return []
 
         try:
             data = json.loads(raw)
         except json.JSONDecodeError:
-            return None
+            return []
 
-        # ACK sync push messages
         lwp = data.get("lwp", "")
-        if lwp == "/s/sync" or "syncPushPackage" in lwp or "sync" in lwp.lower():
-            # Send ACK back to server
+        is_sync = (
+            lwp == "/s/sync"
+            or "syncPushPackage" in lwp
+            or "vulcan" in lwp
+            or "sync" in lwp.lower()
+        )
+
+        if is_sync:
+            # ACK the push
             mid = data.get("headers", {}).get("mid", "")
             sid = data.get("headers", {}).get("sid", "")
             if mid:
                 asyncio.ensure_future(self._ack_message(mid, sid))
 
-            body = data.get("body", {})
+        body = data.get("body", {})
+        if not isinstance(body, dict):
+            return []
+
+        results: list[dict[str, Any]] = []
+
+        # --- Primary path: syncPushPackage.data[] ---
+        spp = body.get("syncPushPackage", {})
+        if isinstance(spp, dict):
+            items = spp.get("data", [])
+            if isinstance(items, list):
+                for item in items:
+                    if isinstance(item, dict):
+                        parsed = self._decode_spp_item(item)
+                        if parsed:
+                            results.append(parsed)
+
+        # --- Legacy fallback: body.data (single encrypted push) ---
+        if not results:
             push_data = body.get("data", "")
-            if push_data:
+            if push_data and isinstance(push_data, str):
                 decoded = decrypt_message(push_data)
-                if isinstance(decoded, dict):
-                    return decoded
+                if isinstance(decoded, dict) and decoded.get("senderId"):
+                    results.append(decoded)
 
-        # Regular message response
-        if data.get("body"):
-            return data["body"]
+        return results
 
-        return None
+    def _parse_push_message(self, raw: str | bytes) -> dict[str, Any] | None:
+        """Parse an incoming WebSocket message (compat wrapper).
+
+        Returns the first chat message found, or None.
+        """
+        msgs = self._parse_push_messages(raw)
+        return msgs[0] if msgs else None
 
     async def _ack_message(self, mid: str, sid: str = "") -> None:
         """Send ACK for a received push message."""
@@ -529,39 +681,39 @@ class GoofishWebSocket:
                 except asyncio.TimeoutError:
                     continue
 
-                parsed = self._parse_push_message(raw)
-                if not parsed:
-                    continue
+                for parsed in self._parse_push_messages(raw):
+                    sender_id = str(
+                        parsed.get("senderId", parsed.get("senderUid", ""))
+                    )
+                    if sender_id not in target_sender_ids:
+                        continue
+                    if sender_id in replied_ids:
+                        continue
 
-                sender_id = str(
-                    parsed.get("senderId", parsed.get("senderUid", ""))
-                )
-                if sender_id not in target_sender_ids:
-                    continue
-                if sender_id in replied_ids:
-                    # Already got a reply from this seller, skip duplicates
-                    continue
+                    # Skip our own messages (echo)
+                    if sender_id == self.user_id:
+                        continue
 
-                content = parsed.get("content", "")
-                if isinstance(content, str):
-                    content = parse_message_content(content)
+                    content = parsed.get("content", "")
+                    if isinstance(content, str):
+                        content = parse_message_content(content)
 
-                replied_ids.add(sender_id)
-                replies.append({
-                    "seller_id": sender_id,
-                    "seller_name": parsed.get(
-                        "senderNick", parsed.get("senderName", "")
-                    ),
-                    "content": content,
-                    "time": parsed.get("gmtCreate", parsed.get("time", "")),
-                })
+                    replied_ids.add(sender_id)
+                    replies.append({
+                        "seller_id": sender_id,
+                        "seller_name": parsed.get(
+                            "senderNick", parsed.get("senderName", "")
+                        ),
+                        "content": content,
+                        "time": parsed.get("gmtCreate", parsed.get("time", "")),
+                    })
 
-                logger.info(
-                    "Collected reply from %s (%d/%d)",
-                    sender_id,
-                    len(replied_ids),
-                    len(target_sender_ids),
-                )
+                    logger.info(
+                        "Collected reply from %s (%d/%d)",
+                        sender_id,
+                        len(replied_ids),
+                        len(target_sender_ids),
+                    )
 
                 # All targets replied — exit early
                 if replied_ids >= target_sender_ids:

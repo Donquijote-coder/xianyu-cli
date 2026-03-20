@@ -155,11 +155,12 @@ def send(ctx: click.Context, user_id: str, text: str, item_id: str | None) -> No
 
 
 @message.command()
+@click.option("--timeout", type=int, default=180, help="监听超时时间（秒），默认180（3分钟）")
 @click.pass_context
-def watch(ctx: click.Context) -> None:
+def watch(ctx: click.Context, timeout: int) -> None:
     """实时监听新消息（WebSocket长连接）
 
-    使用 Ctrl+C 退出
+    默认监听3分钟后自动退出，也可用 Ctrl+C 提前退出
     """
     output = ctx.obj.get("output", "rich")
     cred = _require_login(output)
@@ -167,7 +168,7 @@ def watch(ctx: click.Context) -> None:
         return
 
     console.print("[cyan]正在连接消息服务...[/cyan]")
-    console.print("[dim]按 Ctrl+C 退出[/dim]")
+    console.print(f"[dim]超时时间: {timeout}s | 按 Ctrl+C 提前退出[/dim]")
 
     def on_message(msg: dict) -> None:
         sender = msg.get("senderNick", msg.get("senderId", "unknown"))
@@ -177,7 +178,7 @@ def watch(ctx: click.Context) -> None:
         console.print(f"\n[cyan]{sender}[/cyan]: {content}")
 
     try:
-        asyncio.run(_watch_messages(cred, on_message))
+        asyncio.run(_watch_messages(cred, on_message, timeout=timeout))
     except KeyboardInterrupt:
         console.print("\n[yellow]已停止监听[/yellow]")
     except TokenExpiredError:
@@ -336,10 +337,10 @@ async def _send_message(
         await ws.close()
 
 
-async def _watch_messages(cred, on_message) -> None:
+async def _watch_messages(cred, on_message, timeout: int = 180) -> None:
     ws = await _create_ws(cred)
     try:
-        await ws.watch(on_message=on_message)
+        await ws.watch(on_message=on_message, timeout=timeout)
     finally:
         await ws.close()
 

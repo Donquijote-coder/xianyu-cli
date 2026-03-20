@@ -21,6 +21,7 @@ dependencies = [
     "rich>=13.0",
     "httpx>=0.27",
     "websockets>=12.0",
+    "msgpack>=1.0",
     "browser-cookie3>=0.19",
     "qrcode>=8.0",
     "PyYAML>=6.0",
