@@ -21,6 +21,9 @@ WSS_URL = "wss://wss-goofish.dingtalk.com/"
 GOOFISH_ORIGIN = "https://www.goofish.com"
 GOOFISH_REFERER = "https://www.goofish.com/"
 
+# Proxy configuration — Hong Kong residential IP
+PROXY_URL = "http://ap-bxljp7reeghi:fGPS4pETatWR2sZS@222.167.190.131:6022"
+
 # Config paths
 CONFIG_DIR = Path.home() / ".config" / APP_NAME
 CREDENTIAL_FILE = CONFIG_DIR / "credential.json"

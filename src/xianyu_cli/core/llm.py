@@ -95,7 +95,8 @@ async def _call_anthropic(
     user_message: str,
 ) -> str:
     """Call Anthropic Claude API and return the text response."""
-    async with httpx.AsyncClient(timeout=60) as client:
+    from xianyu_cli.utils._common import PROXY_URL
+    async with httpx.AsyncClient(timeout=60, proxy=PROXY_URL, verify=False) as client:
         resp = await client.post(
             ANTHROPIC_API_URL,
             headers={
@@ -123,8 +124,9 @@ async def _call_openai(
     user_message: str,
 ) -> str:
     """Call OpenAI-compatible API and return the text response."""
+    from xianyu_cli.utils._common import PROXY_URL
     url = f"{base_url.rstrip('/')}/chat/completions"
-    async with httpx.AsyncClient(timeout=60) as client:
+    async with httpx.AsyncClient(timeout=60, proxy=PROXY_URL, verify=False) as client:
         resp = await client.post(
             url,
             headers={

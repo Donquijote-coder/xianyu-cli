@@ -13,7 +13,7 @@ from typing import Any
 import httpx
 
 from xianyu_cli.core.sign import extract_token, generate_sign, get_timestamp
-from xianyu_cli.utils._common import API_BASE_URL, APP_KEY
+from xianyu_cli.utils._common import API_BASE_URL, APP_KEY, PROXY_URL
 from xianyu_cli.utils.anti_detect import AntiDetect
 
 logger = logging.getLogger(__name__)
@@ -55,6 +55,7 @@ class GoofishApiClient:
         self.timeout = timeout
         self.max_retries = max_retries
         self._client: httpx.AsyncClient | None = None
+        self.token_refreshed = False  # True when _m_h5_tk was refreshed
 
     async def __aenter__(self) -> GoofishApiClient:
         headers = self.anti_detect.get_headers()
@@ -62,6 +63,8 @@ class GoofishApiClient:
             timeout=self.timeout,
             headers=headers,
             follow_redirects=True,
+            proxy=PROXY_URL,
+            verify=False,
         )
         return self
 
@@ -172,8 +175,10 @@ class GoofishApiClient:
             headers=headers,
         )
 
-        # Update cookies from response Set-Cookie headers
-        self._update_cookies_from_set_cookie(resp)
+        # Do NOT update cookies from normal API responses.
+        # Cookies are frozen to the login-time values for the entire
+        # session to prevent cookie drift that triggers RGV587.
+        # Only refresh_token() is allowed to update _m_h5_tk.
 
         resp.raise_for_status()
         body = resp.json()
@@ -182,8 +187,14 @@ class GoofishApiClient:
 
     def _update_cookies_from_response(self, resp: httpx.Response) -> None:
         """Capture and store any Set-Cookie headers from the response."""
+        # Do NOT overwrite _m_h5_tk / _m_h5_tk_enc from server responses.
+        # Tokens obtained from the original login session are valid; tokens
+        # returned by the server when accessed via a different IP may trigger
+        # anti-bot (RGV587) on subsequent requests.
+        _protected = {"_m_h5_tk", "_m_h5_tk_enc"}
         for key, value in resp.cookies.items():
-            self.cookies[key] = value
+            if key not in _protected:
+                self.cookies[key] = value
 
     def _parse_response(self, body: dict[str, Any]) -> dict[str, Any]:
         """Parse the mtop API response, checking for errors."""
@@ -217,7 +228,7 @@ class GoofishApiClient:
                 name, _, value = name_value.partition("=")
                 name = name.strip()
                 value = value.strip()
-                if name and value:
+                if name and value and name not in {"_m_h5_tk", "_m_h5_tk_enc"}:
                     self.cookies[name] = value
 
     async def refresh_token(self) -> None:
@@ -248,6 +259,8 @@ class GoofishApiClient:
             follow_redirects=True,
             timeout=15.0,
             headers=self.anti_detect.get_headers(),
+            proxy=PROXY_URL,
+            verify=False,
         ) as fresh:
             # Try h5api first, then main site, then h5api again
             for attempt_url in [url, "https://www.goofish.com/", url]:
@@ -256,9 +269,20 @@ class GoofishApiClient:
                     resp = await fresh.get(
                         attempt_url, headers=headers, params=p
                     )
-                    self._update_cookies_from_set_cookie(resp)
+                    # Only extract _m_h5_tk tokens from refresh responses
+                    for key, value in resp.cookies.items():
+                        if key in ("_m_h5_tk", "_m_h5_tk_enc"):
+                            self.cookies[key] = value
+                    for raw in resp.headers.get_list("set-cookie"):
+                        if "=" in raw:
+                            nv = raw.split(";")[0]
+                            k, _, v = nv.partition("=")
+                            k, v = k.strip(), v.strip()
+                            if k in ("_m_h5_tk", "_m_h5_tk_enc") and v:
+                                self.cookies[k] = v
                     headers["Cookie"] = self._build_cookie_header()
                     if "_m_h5_tk" in self.cookies:
+                        self.token_refreshed = True
                         break
                 except Exception:
                     logger.debug("Refresh attempt failed: %s", attempt_url)

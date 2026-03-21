@@ -20,7 +20,7 @@ import websockets
 
 from xianyu_cli.core.crypto import decrypt_message
 from xianyu_cli.models.message import parse_message_content
-from xianyu_cli.utils._common import MSG_APP_KEY, WSS_URL, console
+from xianyu_cli.utils._common import MSG_APP_KEY, PROXY_URL, WSS_URL, console
 from xianyu_cli.utils.anti_detect import DEFAULT_HEADERS
 
 logger = logging.getLogger(__name__)
@@ -52,6 +52,7 @@ class GoofishWebSocket:
         self.device_id = device_id or str(uuid.uuid4()).replace("-", "")[:16]
         self._ws: Any = None
         self._running = False
+        self._heartbeat_task: asyncio.Task | None = None
 
     def _build_cookie_header(self) -> str:
         return "; ".join(f"{k}={v}" for k, v in self.cookies.items())
@@ -77,13 +78,19 @@ class GoofishWebSocket:
         self._ws = await websockets.connect(
             WSS_URL,
             additional_headers=headers,
+            proxy=PROXY_URL,
         )
 
         # Send registration message and wait for response
         await self._register()
         # Send sync ack so the server starts delivering messages
         await self._sync_ack(sync_from_ts=sync_from_ts)
-        logger.info("WebSocket connected, registered, and synced")
+
+        # Start heartbeat immediately so the connection stays alive
+        # during any operation (broadcast, watch, etc.)
+        self._running = True
+        self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
+        logger.info("WebSocket connected, registered, synced, and heartbeat started")
 
     async def _register(self) -> None:
         """Send registration message to establish the session."""
@@ -405,11 +412,9 @@ class GoofishWebSocket:
             timeout: Maximum seconds to watch before auto-stopping. Default 180 (3 min).
         """
         assert self._ws is not None
-        self._running = True
         start = asyncio.get_event_loop().time()
 
-        # Start heartbeat task
-        heartbeat_task = asyncio.create_task(self._heartbeat_loop())
+        # Heartbeat is managed by connect()/close(), no need to start here.
 
         try:
             while self._running:
@@ -431,13 +436,6 @@ class GoofishWebSocket:
 
         except websockets.exceptions.ConnectionClosed:
             logger.info("WebSocket connection closed")
-        finally:
-            self._running = False
-            heartbeat_task.cancel()
-            try:
-                await heartbeat_task
-            except asyncio.CancelledError:
-                pass
 
     async def _heartbeat_loop(self) -> None:
         """Send periodic heartbeat pings."""
@@ -660,10 +658,9 @@ class GoofishWebSocket:
             timeout: Maximum seconds to wait.
         """
         assert self._ws is not None
-        self._running = True
-
-        heartbeat_task = asyncio.create_task(self._heartbeat_loop())
         start_time = time.time()
+
+        # Heartbeat is managed by connect()/close(), no need to start here.
 
         try:
             while self._running:
@@ -721,17 +718,17 @@ class GoofishWebSocket:
 
         except websockets.exceptions.ConnectionClosed:
             logger.info("WebSocket connection closed during collect")
-        finally:
-            self._running = False
-            heartbeat_task.cancel()
-            try:
-                await heartbeat_task
-            except asyncio.CancelledError:
-                pass
 
     async def close(self) -> None:
-        """Close the WebSocket connection."""
+        """Close the WebSocket connection and stop heartbeat."""
         self._running = False
+        if self._heartbeat_task:
+            self._heartbeat_task.cancel()
+            try:
+                await self._heartbeat_task
+            except asyncio.CancelledError:
+                pass
+            self._heartbeat_task = None
         if self._ws:
             await self._ws.close()
             self._ws = None

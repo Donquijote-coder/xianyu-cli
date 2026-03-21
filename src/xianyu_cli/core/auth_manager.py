@@ -21,7 +21,7 @@ import qrcode
 from rich.live import Live
 from rich.text import Text
 
-from xianyu_cli.utils._common import APP_KEY, console
+from xianyu_cli.utils._common import APP_KEY, PROXY_URL, console
 from xianyu_cli.utils.anti_detect import DEFAULT_HEADERS
 from xianyu_cli.utils.cookie import extract_browser_cookies
 from xianyu_cli.utils.credential import (
@@ -109,6 +109,8 @@ class AuthManager:
             follow_redirects=True,
             timeout=30.0,
             headers=dict(DEFAULT_HEADERS),
+            proxy=PROXY_URL,
+            verify=False,
         ) as client:
             # Step 1: Get initial cookies
             console.print("[dim]正在初始化登录会话...[/dim]")
@@ -191,6 +193,8 @@ class AuthManager:
             follow_redirects=True,
             timeout=30.0,
             headers=dict(DEFAULT_HEADERS),
+            proxy=PROXY_URL,
+            verify=False,
         ) as client:
             session_cookies: dict[str, str] = {}
             resp = await client.get(_QR_M_H5_TK_URL)
@@ -415,6 +419,8 @@ class AuthManager:
         async with httpx.AsyncClient(
             follow_redirects=True,
             timeout=15.0,
+            proxy=PROXY_URL,
+            verify=False,
         ) as fresh_client:
             for url in refresh_urls:
                 if "_m_h5_tk" in cookies:

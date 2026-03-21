@@ -27,10 +27,14 @@ async def run_api_call(
     async with GoofishApiClient(cred.cookies) as client:
         result = await client.call(api, data, version)
 
-        # Persist updated cookies (token refresh, new _m_h5_tk, etc.)
-        if client.cookies != cred.cookies:
-            logger.info("Cookies updated during API call, saving credential")
-            cred.cookies = client.cookies
+        # Only persist cookies when the token was refreshed (expired → new).
+        # Normal API responses update cookies in memory but we do NOT save
+        # those — saving server-issued cookies from a proxy IP can poison
+        # the session and trigger RGV587 on subsequent CLI invocations.
+        if client.token_refreshed:
+            logger.info("Token was refreshed, saving updated credential")
+            cred.cookies["_m_h5_tk"] = client.cookies.get("_m_h5_tk", "")
+            cred.cookies["_m_h5_tk_enc"] = client.cookies.get("_m_h5_tk_enc", "")
             save_credential(cred)
 
         return result
