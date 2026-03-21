@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
@@ -21,8 +22,9 @@ WSS_URL = "wss://wss-goofish.dingtalk.com/"
 GOOFISH_ORIGIN = "https://www.goofish.com"
 GOOFISH_REFERER = "https://www.goofish.com/"
 
-# Proxy configuration — Hong Kong residential IP
-PROXY_URL = "http://ap-bxljp7reeghi:fGPS4pETatWR2sZS@222.167.190.131:6022"
+# Proxy configuration — read from environment variable
+# Format: http://user:pass@host:port  (or empty to disable proxy)
+PROXY_URL = os.environ.get("XIANYU_PROXY_URL", "") or None
 
 # Config paths
 CONFIG_DIR = Path.home() / ".config" / APP_NAME
