@@ -446,9 +446,9 @@ class GoofishWebSocket:
                 await asyncio.sleep(HEARTBEAT_INTERVAL)
                 hb = json.dumps({"lwp": "/!", "headers": {"mid": _generate_mid()}})
                 await self._ws.send(hb)
-                logger.debug("Heartbeat sent")
-            except Exception:
-                logger.debug("Heartbeat failed", exc_info=True)
+                logger.info("Heartbeat sent")
+            except Exception as e:
+                logger.warning("Heartbeat failed: %s", e)
                 break
 
     @staticmethod
@@ -640,6 +640,8 @@ class GoofishWebSocket:
         except Exception:
             logger.debug("ACK failed for mid=%s", mid)
 
+    MAX_RECONNECTS = 3
+
     async def watch_filtered(
         self,
         target_sender_ids: set[str],
@@ -649,7 +651,10 @@ class GoofishWebSocket:
     ) -> None:
         """Watch for messages from specific senders, collecting their replies.
 
-        Exits when all target senders have replied or timeout is reached.
+        Exits when all target senders have replied, timeout is reached, or
+        max reconnection attempts are exhausted.  On disconnect, automatically
+        reconnects and uses ``sync_from_ts`` to recover messages received
+        during the brief reconnection window.
 
         Args:
             target_sender_ids: Set of user IDs to monitor.
@@ -659,65 +664,136 @@ class GoofishWebSocket:
         """
         assert self._ws is not None
         start_time = time.time()
+        reconnect_count = 0
+        # Track the last timestamp so we can resume without message loss
+        last_sync_ts = int(time.time() * 1000)
 
-        # Heartbeat is managed by connect()/close(), no need to start here.
+        while True:
+            try:
+                while self._running:
+                    elapsed = time.time() - start_time
+                    if elapsed >= timeout:
+                        return
 
-        try:
-            while self._running:
+                    remaining = timeout - elapsed
+                    recv_timeout = min(30, remaining)
+
+                    try:
+                        raw = await asyncio.wait_for(
+                            self._ws.recv(), timeout=recv_timeout
+                        )
+                    except asyncio.TimeoutError:
+                        continue
+
+                    # Update sync timestamp to now (we're alive and receiving)
+                    last_sync_ts = int(time.time() * 1000)
+
+                    for parsed in self._parse_push_messages(raw):
+                        sender_id = str(
+                            parsed.get("senderId", parsed.get("senderUid", ""))
+                        )
+                        if sender_id not in target_sender_ids:
+                            continue
+                        if sender_id in replied_ids:
+                            continue
+
+                        # Skip our own messages (echo)
+                        if sender_id == self.user_id:
+                            continue
+
+                        content = parsed.get("content", "")
+                        if isinstance(content, str):
+                            content = parse_message_content(content)
+
+                        replied_ids.add(sender_id)
+                        replies.append({
+                            "seller_id": sender_id,
+                            "seller_name": parsed.get(
+                                "senderNick", parsed.get("senderName", "")
+                            ),
+                            "content": content,
+                            "time": parsed.get("gmtCreate", parsed.get("time", "")),
+                        })
+
+                        logger.info(
+                            "Collected reply from %s (%d/%d)",
+                            sender_id,
+                            len(replied_ids),
+                            len(target_sender_ids),
+                        )
+
+                    # All targets replied — exit early
+                    if replied_ids >= target_sender_ids:
+                        return
+
+                # _running became False — exit
+                return
+
+            except websockets.exceptions.ConnectionClosed as e:
                 elapsed = time.time() - start_time
+                reconnect_count += 1
+                logger.warning(
+                    "WebSocket disconnected after %.0fs (attempt %d/%d): code=%s reason=%s",
+                    elapsed, reconnect_count, self.MAX_RECONNECTS, e.code, e.reason,
+                )
+
+                if reconnect_count > self.MAX_RECONNECTS:
+                    logger.warning("Max reconnects (%d) reached, stopping", self.MAX_RECONNECTS)
+                    return
+
                 if elapsed >= timeout:
-                    break
+                    return
 
-                remaining = timeout - elapsed
-                recv_timeout = min(30, remaining)
-
+                # Reconnect with sync_from_ts to recover missed messages
                 try:
-                    raw = await asyncio.wait_for(
-                        self._ws.recv(), timeout=recv_timeout
+                    console.print(
+                        f"[dim]  WebSocket 断开，正在重连 ({reconnect_count}/{self.MAX_RECONNECTS})...[/dim]"
                     )
-                except asyncio.TimeoutError:
-                    continue
+                    await self._reconnect(sync_from_ts=last_sync_ts)
+                    console.print("[dim]  重连成功，继续监听[/dim]")
+                except Exception as re_err:
+                    logger.warning("Reconnect failed: %s", re_err)
+                    console.print(f"[yellow]  重连失败: {re_err}[/yellow]")
+                    return
 
-                for parsed in self._parse_push_messages(raw):
-                    sender_id = str(
-                        parsed.get("senderId", parsed.get("senderUid", ""))
-                    )
-                    if sender_id not in target_sender_ids:
-                        continue
-                    if sender_id in replied_ids:
-                        continue
+    async def _reconnect(self, sync_from_ts: int | None = None) -> None:
+        """Reconnect the WebSocket after a disconnect.
 
-                    # Skip our own messages (echo)
-                    if sender_id == self.user_id:
-                        continue
+        Stops the old heartbeat, establishes a new connection, re-registers,
+        syncs from the given timestamp (to recover missed messages), and
+        restarts the heartbeat.
+        """
+        # Stop old heartbeat
+        if self._heartbeat_task:
+            self._heartbeat_task.cancel()
+            try:
+                await self._heartbeat_task
+            except asyncio.CancelledError:
+                pass
+            self._heartbeat_task = None
 
-                    content = parsed.get("content", "")
-                    if isinstance(content, str):
-                        content = parse_message_content(content)
+        # Close old socket silently
+        if self._ws:
+            try:
+                await self._ws.close()
+            except Exception:
+                pass
+            self._ws = None
 
-                    replied_ids.add(sender_id)
-                    replies.append({
-                        "seller_id": sender_id,
-                        "seller_name": parsed.get(
-                            "senderNick", parsed.get("senderName", "")
-                        ),
-                        "content": content,
-                        "time": parsed.get("gmtCreate", parsed.get("time", "")),
-                    })
+        # Establish new connection
+        headers = self._build_headers()
+        self._ws = await websockets.connect(
+            WSS_URL,
+            additional_headers=headers,
+            proxy=PROXY_URL,
+        )
+        await self._register()
+        await self._sync_ack(sync_from_ts=sync_from_ts)
 
-                    logger.info(
-                        "Collected reply from %s (%d/%d)",
-                        sender_id,
-                        len(replied_ids),
-                        len(target_sender_ids),
-                    )
-
-                # All targets replied — exit early
-                if replied_ids >= target_sender_ids:
-                    break
-
-        except websockets.exceptions.ConnectionClosed:
-            logger.info("WebSocket connection closed during collect")
+        # Restart heartbeat
+        self._running = True
+        self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
+        logger.info("WebSocket reconnected and synced from ts=%s", sync_from_ts)
 
     async def close(self) -> None:
         """Close the WebSocket connection and stop heartbeat."""
@@ -730,5 +806,8 @@ class GoofishWebSocket:
                 pass
             self._heartbeat_task = None
         if self._ws:
-            await self._ws.close()
+            try:
+                await self._ws.close()
+            except Exception:
+                pass
             self._ws = None
