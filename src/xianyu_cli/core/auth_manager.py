@@ -138,8 +138,10 @@ class AuthManager:
             login_params["t"] = str(qr_data.get("t", ""))
             login_params["ck"] = qr_data.get("ck", "")
 
-            # Render QR code in terminal
+            # Render QR code in terminal and save to file
             self._render_qr(qr_content)
+            qr_image_path = self._save_qr_image(qr_content)
+            console.print(f"[dim]二维码已保存到: {qr_image_path}[/dim]")
             console.print("[cyan]请使用闲鱼 App 扫描上方二维码登录[/cyan]")
             console.print("[dim]等待扫码中... (5分钟超时)[/dim]")
 
@@ -213,8 +215,9 @@ class AuthManager:
             login_params["t"] = str(qr_data.get("t", ""))
             login_params["ck"] = qr_data.get("ck", "")
 
-            # Generate QR image as base64 PNG
+            # Generate QR image as base64 PNG and save to file
             qr_image_b64 = self._qr_to_base64(qr_content)
+            qr_image_path = self._save_qr_image(qr_content)
 
             # Emit QR data to stdout for agent consumption
             from xianyu_cli.models.envelope import ok
@@ -222,6 +225,7 @@ class AuthManager:
                 "status": "waiting",
                 "qr_url": qr_content,
                 "qr_image_base64": qr_image_b64,
+                "qr_image_path": qr_image_path,
             }).emit("json")
 
             # Poll for scan
@@ -244,8 +248,8 @@ class AuthManager:
             return {"status": "confirmed", "user_id": user_id}
 
     @staticmethod
-    def _qr_to_base64(content: str) -> str:
-        """Generate a QR code PNG and return it as a base64 string."""
+    def _make_qr_image(content: str):
+        """Generate a QR code PIL image."""
         qr = qrcode.QRCode(
             version=1,
             error_correction=qrcode.constants.ERROR_CORRECT_L,
@@ -254,11 +258,27 @@ class AuthManager:
         )
         qr.add_data(content)
         qr.make(fit=True)
+        return qr.make_image(fill_color="black", back_color="white")
 
-        img = qr.make_image(fill_color="black", back_color="white")
+    @staticmethod
+    def _qr_to_base64(content: str) -> str:
+        """Generate a QR code PNG and return it as a base64 string."""
+        img = AuthManager._make_qr_image(content)
         buf = io.BytesIO()
         img.save(buf, format="PNG")
         return base64.b64encode(buf.getvalue()).decode("ascii")
+
+    @staticmethod
+    def _save_qr_image(content: str, path: str | None = None) -> str:
+        """Save QR code as PNG file and return the absolute path."""
+        import os
+        if path is None:
+            qr_dir = "/tmp/xianyu"
+            os.makedirs(qr_dir, exist_ok=True)
+            path = os.path.join(qr_dir, "login_qr.png")
+        img = AuthManager._make_qr_image(content)
+        img.save(path, format="PNG")
+        return os.path.abspath(path)
 
     async def _get_login_params(
         self,
@@ -366,7 +386,31 @@ class AuthManager:
                 if "token" in data:
                     result_cookies["token"] = data["token"]
 
-                logger.debug("CONFIRMED cookies: %s", list(result_cookies.keys()))
+                logger.debug("CONFIRMED response data keys: %s", list(data.keys()))
+                logger.debug("CONFIRMED cookies so far: %s", list(result_cookies.keys()))
+
+                # Critical: follow returnUrl to get full session cookies (incl. unb/user_id)
+                # Real browsers redirect to this URL after CONFIRMED to receive all cookies
+                return_url = data.get("returnUrl", "")
+                if return_url:
+                    logger.debug("Following returnUrl: %s", return_url[:80])
+                    # Merge current cookies for the follow-up request
+                    merged = {**cookies, **result_cookies}
+                    try:
+                        redirect_resp = await client.get(
+                            return_url,
+                            cookies=merged,
+                            follow_redirects=True,
+                        )
+                        _collect_set_cookies(redirect_resp, result_cookies)
+                        logger.debug(
+                            "After returnUrl: cookies=%s, status=%d",
+                            list(result_cookies.keys()),
+                            redirect_resp.status_code,
+                        )
+                    except Exception as exc:
+                        logger.warning("Failed to follow returnUrl: %s", exc)
+
                 return result_cookies
             elif status == "EXPIRED":
                 console.print("[red]二维码已过期，请重新登录[/red]")

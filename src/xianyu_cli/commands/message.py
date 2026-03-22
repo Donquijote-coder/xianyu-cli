@@ -443,6 +443,9 @@ async def _collect_replies(
 ) -> dict:
     """Monitor WebSocket for replies from specific sellers.
 
+    After WebSocket monitoring ends, performs an HTTP API fallback to catch
+    replies that may have been missed during WebSocket disconnects.
+
     Args:
         lookback: Seconds to look back when syncing.  When > 0, the WebSocket
             connection syncs from ``now - lookback`` so the server may push
@@ -450,7 +453,10 @@ async def _collect_replies(
         ws: Optional pre-existing WebSocket connection to reuse.
             When provided, the caller is responsible for closing it.
     """
+    import logging
     import time
+
+    logger = logging.getLogger(__name__)
 
     own_ws = ws is None
     if own_ws:
@@ -476,6 +482,27 @@ async def _collect_replies(
         if own_ws:
             await ws.close()
 
+    # --- HTTP API fallback: catch replies missed during WS disconnects ---
+    unreplied_ids = target_ids - replied_ids
+    if unreplied_ids:
+        try:
+            fallback = await _fallback_fetch_replies(cred, unreplied_ids)
+            for reply in fallback:
+                sid = reply["seller_id"]
+                if sid not in replied_ids:
+                    replied_ids.add(sid)
+                    replies.append(reply)
+                    console.print(
+                        f"[dim]  (HTTP兜底) 补获卖家 "
+                        f"{reply.get('seller_name') or sid} 的回复[/dim]"
+                    )
+            if fallback:
+                logger.info(
+                    "HTTP fallback recovered %d replies", len(fallback)
+                )
+        except Exception as e:
+            logger.debug("HTTP fallback failed: %s", e)
+
     no_reply = [sid for sid in seller_ids if sid not in replied_ids]
     elapsed = int(time.time() - start_time)
 
@@ -485,3 +512,67 @@ async def _collect_replies(
         "timeout_reached": elapsed >= timeout,
         "duration_seconds": elapsed,
     }
+
+
+async def _fallback_fetch_replies(
+    cred, target_seller_ids: set[str],
+) -> list[dict]:
+    """Fetch recent conversations via HTTP API and extract replies from target sellers.
+
+    This serves as a fallback when WebSocket monitoring misses messages due to
+    disconnects.  It pulls the conversation head list and, for conversations
+    whose peer is a target seller, fetches the latest messages to find their reply.
+    """
+    from xianyu_cli.core.session import run_api_call
+
+    # Step 1: Get recent conversation list
+    head_info = await run_api_call(
+        cred, "mtop.taobao.idle.trade.pc.message.headinfo", {}
+    )
+    convs = parse_conversations(head_info)
+
+    # Step 2: Match conversations to unreplied sellers
+    matched: list[tuple[str, str, str]] = []  # (conv_id, seller_id, peer_name)
+    for conv in convs:
+        peer_id = str(conv.get("peer_id", ""))
+        if peer_id in target_seller_ids:
+            matched.append((conv["id"], peer_id, conv.get("peer_name", "")))
+
+    if not matched:
+        return []
+
+    # Step 3: For each matched conversation, fetch recent messages
+    recovered: list[dict] = []
+    my_user_id = cred.cookies.get("unb", "")
+
+    for conv_id, seller_id, peer_name in matched:
+        try:
+            result = await run_api_call(
+                cred,
+                "mtop.taobao.idle.trade.pc.message.list",
+                {"conversationId": conv_id, "pageSize": 10},
+            )
+            messages = result.get("messages", [])
+
+            # Find the latest message from the seller (not from us)
+            for msg in messages:
+                sender_id = str(
+                    msg.get("senderId", msg.get("senderUserId", ""))
+                )
+                if sender_id == seller_id or (
+                    sender_id != my_user_id and sender_id
+                ):
+                    content = parse_message_content(msg.get("content", ""))
+                    if content:
+                        recovered.append({
+                            "seller_id": seller_id,
+                            "seller_name": peer_name
+                            or msg.get("senderNick", ""),
+                            "content": content,
+                            "time": msg.get("gmtCreate", ""),
+                        })
+                        break
+        except Exception:
+            continue
+
+    return recovered
