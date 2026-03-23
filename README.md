@@ -1,4 +1,4 @@
-# xianyu-cli (咸鱼cli)
+# xianyu-cli (闲鱼cli)
 
 闲鱼命令行工具 — 基于逆向工程的 Goofish CLI。
 
