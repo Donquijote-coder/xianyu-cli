@@ -35,14 +35,14 @@ def mock_api_response() -> dict:
                                     "detailParams": {
                                         "itemId": "123456",
                                         "title": "iPhone 15 Pro 256G",
-                                        "soldPrice": "599900",
+                                        "soldPrice": "5999",
                                         "userNick": "测试卖家",
                                     },
                                 },
                                 "clickParam": {
                                     "args": {
                                         "id": "123456",
-                                        "price": "599900",
+                                        "price": "5999",
                                         "p_city": "杭州市",
                                         "seller_id": "user001",
                                     }

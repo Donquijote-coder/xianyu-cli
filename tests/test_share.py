@@ -113,12 +113,12 @@ class TestExtractShareText:
         text = _extract_share_text(detail)
         assert "【闲鱼】" in text
         assert "农耕记代金券" in text
-        assert "¥0.78" in text
+        assert "¥78" in text
 
     def test_with_default_price(self):
         detail = {"itemDO": {"title": "测试商品", "defaultPrice": "1500"}}
         text = _extract_share_text(detail)
-        assert "¥15.00" in text
+        assert "¥1500" in text
 
     def test_title_only(self):
         detail = {"itemDO": {"title": "只有标题"}}

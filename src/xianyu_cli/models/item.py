@@ -35,13 +35,14 @@ def parse_search_items(raw_data: dict[str, Any]) -> list[dict[str, Any]]:
         # detailParams may be empty — fall back to exContent direct fields
         item_id = detail.get("itemId") or ex.get("itemId") or args.get("id") or ""
         title = detail.get("title") or ex.get("title", "")
-        # soldPrice / args.price are in cents; exContent.price is in yuan
-        raw_price_cents = detail.get("soldPrice") or args.get("price", "")
+        # soldPrice / args.price are in yuan (元), NOT cents.
+        # exContent.price is a structured list also in yuan.
+        raw_price = detail.get("soldPrice") or args.get("price", "")
         price_from_ex = ""
-        if not raw_price_cents:
+        if not raw_price:
             ex_price = ex.get("price", "")
             if isinstance(ex_price, list):
-                # e.g. [{"text": "¥", "type": "sign"}, {"text": "118", "type": "integer"}]
+                # e.g. [{"text": "¥", "type": "sign"}, {"text": "136", "type": "integer"}, {"text": ".88", "type": "decimal"}]
                 price_from_ex = "".join(
                     p.get("text", "") for p in ex_price
                     if isinstance(p, dict) and p.get("type") in ("integer", "decimal")
@@ -52,12 +53,8 @@ def parse_search_items(raw_data: dict[str, Any]) -> list[dict[str, Any]]:
         seller_name = detail.get("userNick") or ex.get("userNickName", "")
         location = ex.get("area") or args.get("p_city", "")
 
-        # Convert price: cents → yuan, or use exContent price directly (already yuan)
-        if raw_price_cents:
-            try:
-                price = f"{int(raw_price_cents) / 100:.2f}"
-            except (ValueError, TypeError):
-                price = str(raw_price_cents)
+        if raw_price:
+            price = str(raw_price)
         elif price_from_ex:
             price = str(price_from_ex)
         else:

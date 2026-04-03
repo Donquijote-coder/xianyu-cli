@@ -6,10 +6,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"math/rand"
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -27,7 +29,100 @@ const (
 	qrQueryURL     = "https://passport.goofish.com/newlogin/qrcode/query.do"
 	qrPollInterval = 800 * time.Millisecond
 	qrTimeout      = 5 * time.Minute
+
+	tokenRefreshMaxRetries = 3
 )
+
+// ---------------------------------------------------------------------------
+// Notification helpers — send messages to the user's chat channel via OpenClaw
+// ---------------------------------------------------------------------------
+
+type notifyConfig struct {
+	Channel string
+	Target  string
+	Account string
+}
+
+func loadNotifyConfig() notifyConfig {
+	cfg := notifyConfig{
+		Channel: os.Getenv("OPENCLAW_NOTIFY_CHANNEL"),
+		Target:  os.Getenv("OPENCLAW_NOTIFY_TARGET"),
+		Account: os.Getenv("OPENCLAW_NOTIFY_ACCOUNT"),
+	}
+	if cfg.Channel != "" && cfg.Target != "" && cfg.Account != "" {
+		return cfg
+	}
+
+	// Auto-detect from OpenClaw session file
+	home, _ := os.UserHomeDir()
+	sessFile := filepath.Join(home, ".openclaw", "agents", "main", "sessions", "sessions.json")
+	data, err := os.ReadFile(sessFile)
+	if err != nil {
+		return cfg
+	}
+	var sessions map[string]interface{}
+	if json.Unmarshal(data, &sessions) != nil {
+		return cfg
+	}
+	mainSession, _ := sessions["agent:main:main"].(map[string]interface{})
+	ctx, _ := mainSession["deliveryContext"].(map[string]interface{})
+	if ctx == nil {
+		return cfg
+	}
+	if cfg.Channel == "" {
+		cfg.Channel, _ = ctx["channel"].(string)
+	}
+	if cfg.Target == "" {
+		cfg.Target, _ = ctx["to"].(string)
+	}
+	if cfg.Account == "" {
+		cfg.Account, _ = ctx["accountId"].(string)
+	}
+	return cfg
+}
+
+func (n notifyConfig) enabled() bool {
+	return n.Channel != "" && n.Target != "" && n.Account != ""
+}
+
+func (n notifyConfig) sendText(text string) {
+	if !n.enabled() {
+		log.Printf("Notify (no channel): %s", text)
+		return
+	}
+	cmd := exec.Command("openclaw", "message", "send",
+		"--channel", n.Channel,
+		"--account", n.Account,
+		"--target", n.Target,
+		"--message", text,
+	)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		log.Printf("notify_text failed: %s %s", err, string(out))
+	}
+}
+
+func (n notifyConfig) sendQR(path string) {
+	if !n.enabled() {
+		log.Printf("Notify QR (no channel): %s", path)
+		return
+	}
+	cmd := exec.Command("openclaw", "message", "send",
+		"--channel", n.Channel,
+		"--account", n.Account,
+		"--target", n.Target,
+		"--media", path,
+		"--message", "闲鱼登录二维码，5分钟内有效，请用闲鱼 App 扫码并确认登录。",
+	)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		log.Printf("notify_qr failed: %s %s", err, string(out))
+	}
+}
+
+// ---------------------------------------------------------------------------
+// AuthManager
+// ---------------------------------------------------------------------------
 
 // AuthManager manages authentication with three-tier fallback.
 type AuthManager struct {
@@ -80,8 +175,55 @@ func newHTTPClient() *http.Client {
 	}
 }
 
+// extractUserIDFromSTag extracts user ID from the s_tag response header.
+// Format: "...^xianyu:2997347010:^..."
+func extractUserIDFromSTag(resp *http.Response) string {
+	if resp == nil {
+		return ""
+	}
+	sTag := resp.Header.Get("s_tag")
+	re := regexp.MustCompile(`xianyu:(\d+):`)
+	m := re.FindStringSubmatch(sTag)
+	if len(m) >= 2 {
+		return m[1]
+	}
+	return ""
+}
+
+// refreshMH5TKWithRetry attempts to refresh _m_h5_tk with retries.
+// Returns true if token is present after attempts.
+func refreshMH5TKWithRetry(cookies map[string]string) bool {
+	for attempt := 1; attempt <= tokenRefreshMaxRetries; attempt++ {
+		refreshMH5TK(cookies)
+		if _, ok := cookies["_m_h5_tk"]; ok {
+			return true
+		}
+		if attempt < tokenRefreshMaxRetries {
+			time.Sleep(2 * time.Second)
+		}
+	}
+	return false
+}
+
+// resolveUserID tries to find the user ID from cookies and response headers.
+func resolveUserID(cookies map[string]string, confirmedResp *http.Response) string {
+	// Try cookie fields first
+	for _, key := range []string{"unb", "userId", "userid", "uid"} {
+		if v := cookies[key]; v != "" {
+			return v
+		}
+	}
+	// Fallback: extract from s_tag header
+	if uid := extractUserIDFromSTag(confirmedResp); uid != "" {
+		cookies["unb"] = uid
+		return uid
+	}
+	return ""
+}
+
 // QRLogin performs QR code terminal login.
 func (am *AuthManager) QRLogin() *utils.Credential {
+	notify := loadNotifyConfig()
 	client := newHTTPClient()
 	sessionCookies := make(map[string]string)
 
@@ -91,7 +233,9 @@ func (am *AuthManager) QRLogin() *utils.Credential {
 	setDefaultHeaders(req)
 	resp, err := client.Do(req)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, utils.Red.Sprint("初始化会话失败: "+err.Error()))
+		msg := fmt.Sprintf("初始化会话失败: %s", err)
+		fmt.Fprintln(os.Stderr, utils.Red.Sprint(msg))
+		notify.sendText("闲鱼登录失败：" + msg)
 		return nil
 	}
 	collectSetCookies(resp, sessionCookies)
@@ -101,6 +245,7 @@ func (am *AuthManager) QRLogin() *utils.Credential {
 	loginParams := am.getLoginParams(client, sessionCookies)
 	if loginParams == nil {
 		fmt.Fprintln(os.Stderr, utils.Red.Sprint("获取登录参数失败"))
+		notify.sendText("闲鱼登录失败：获取登录参数失败")
 		return nil
 	}
 
@@ -108,6 +253,7 @@ func (am *AuthManager) QRLogin() *utils.Credential {
 	qrData := am.generateQR(client, loginParams)
 	if qrData == nil {
 		fmt.Fprintln(os.Stderr, utils.Red.Sprint("生成二维码失败"))
+		notify.sendText("闲鱼登录失败：生成二维码失败")
 		return nil
 	}
 
@@ -119,15 +265,18 @@ func (am *AuthManager) QRLogin() *utils.Credential {
 		loginParams["ck"] = jsonValToStr(ck)
 	}
 
-	// Render QR in terminal
+	// Render QR in terminal and save image
 	RenderQR(qrContent)
 	qrPath := SaveQRImage(qrContent, "")
 	fmt.Fprintln(os.Stderr, utils.Dim.Sprintf("二维码已保存到: %s", qrPath))
 	fmt.Fprintln(os.Stderr, utils.Cyan.Sprint("请使用闲鱼 App 扫描上方二维码登录"))
 	fmt.Fprintln(os.Stderr, utils.Dim.Sprint("等待扫码中... (5分钟超时)"))
 
+	// Send QR image to user's chat
+	notify.sendQR(qrPath)
+
 	// Step 4: Poll for scan confirmation
-	resultCookies := am.pollQRStatus(client, loginParams, sessionCookies)
+	resultCookies, confirmedResp := am.pollQRStatusWithNotify(client, loginParams, sessionCookies, notify)
 	if resultCookies == nil {
 		return nil
 	}
@@ -137,26 +286,42 @@ func (am *AuthManager) QRLogin() *utils.Credential {
 		sessionCookies[k] = v
 	}
 
-	// Step 5: Refresh m_h5_tk
-	fmt.Fprintln(os.Stderr, utils.Dim.Sprint("正在获取 API token..."))
-	refreshMH5TK(sessionCookies)
-
-	if _, ok := sessionCookies["_m_h5_tk"]; !ok {
-		fmt.Fprintln(os.Stderr, utils.Yellow.Sprint("警告: 未能获取 m_h5_tk token，首次 API 调用时将自动尝试刷新"))
-	} else {
-		fmt.Fprintln(os.Stderr, utils.Dim.Sprint("API token 获取成功"))
+	// Extract user_id from s_tag if unb missing
+	if sessionCookies["unb"] == "" && confirmedResp != nil {
+		if uid := extractUserIDFromSTag(confirmedResp); uid != "" {
+			sessionCookies["unb"] = uid
+			log.Printf("Extracted unb=%s from s_tag header", uid)
+		}
 	}
 
-	userID := sessionCookies["unb"]
+	// Step 5: Refresh m_h5_tk with retry
+	fmt.Fprintln(os.Stderr, utils.Dim.Sprint("正在获取 API token..."))
+	if !refreshMH5TKWithRetry(sessionCookies) {
+		fmt.Fprintln(os.Stderr, utils.Red.Sprint("刷新 token 失败，登录状态不完整，请重试"))
+		notify.sendText("闲鱼登录失败：刷新 token 失败，请重新登录。")
+		return nil
+	}
+	fmt.Fprintln(os.Stderr, utils.Dim.Sprint("API token 获取成功"))
+
+	// Save credential
+	userID := resolveUserID(sessionCookies, confirmedResp)
 	cred := utils.NewCredential(sessionCookies, "qr-login")
 	cred.UserID = userID
 	utils.SaveCredential(cred)
-	fmt.Fprintln(os.Stderr, utils.Green.Sprintf("登录成功！用户ID: %s", userID))
+
+	if userID == "" {
+		fmt.Fprintln(os.Stderr, utils.Yellow.Sprint("登录成功（部分状态缺失，建议重新登录）"))
+		notify.sendText("闲鱼登录成功（部分状态缺失，建议重新登录以获取完整状态）。")
+	} else {
+		fmt.Fprintln(os.Stderr, utils.Green.Sprintf("登录成功！用户ID: %s", userID))
+		notify.sendText(fmt.Sprintf("闲鱼登录成功！用户ID: %s", userID))
+	}
 	return cred
 }
 
 // QRLoginJSON performs QR login returning JSON-friendly status.
 func (am *AuthManager) QRLoginJSON() map[string]interface{} {
+	notify := loadNotifyConfig()
 	client := newHTTPClient()
 	sessionCookies := make(map[string]string)
 
@@ -164,6 +329,7 @@ func (am *AuthManager) QRLoginJSON() map[string]interface{} {
 	setDefaultHeaders(req)
 	resp, err := client.Do(req)
 	if err != nil {
+		notify.sendText("闲鱼登录失败：初始化会话失败")
 		return map[string]interface{}{"status": "error", "message": "初始化会话失败"}
 	}
 	collectSetCookies(resp, sessionCookies)
@@ -171,11 +337,13 @@ func (am *AuthManager) QRLoginJSON() map[string]interface{} {
 
 	loginParams := am.getLoginParams(client, sessionCookies)
 	if loginParams == nil {
+		notify.sendText("闲鱼登录失败：获取登录参数失败")
 		return map[string]interface{}{"status": "error", "message": "获取登录参数失败"}
 	}
 
 	qrData := am.generateQR(client, loginParams)
 	if qrData == nil {
+		notify.sendText("闲鱼登录失败：生成二维码失败")
 		return map[string]interface{}{"status": "error", "message": "生成二维码失败"}
 	}
 
@@ -199,7 +367,10 @@ func (am *AuthManager) QRLoginJSON() map[string]interface{} {
 		},
 	}))
 
-	resultCookies := am.pollQRStatus(client, loginParams, sessionCookies)
+	// Send QR image to user's chat
+	notify.sendQR(qrPath)
+
+	resultCookies, confirmedResp := am.pollQRStatusWithNotify(client, loginParams, sessionCookies, notify)
 	if resultCookies == nil {
 		return map[string]interface{}{"status": "expired", "message": "登录超时或已取消"}
 	}
@@ -207,14 +378,36 @@ func (am *AuthManager) QRLoginJSON() map[string]interface{} {
 	for k, v := range resultCookies {
 		sessionCookies[k] = v
 	}
-	refreshMH5TK(sessionCookies)
 
-	userID := sessionCookies["unb"]
+	// Extract user_id from s_tag if unb missing
+	if sessionCookies["unb"] == "" && confirmedResp != nil {
+		if uid := extractUserIDFromSTag(confirmedResp); uid != "" {
+			sessionCookies["unb"] = uid
+		}
+	}
+
+	// Refresh token with retry
+	if !refreshMH5TKWithRetry(sessionCookies) {
+		notify.sendText("闲鱼登录失败：刷新 token 失败，请重新登录。")
+		return map[string]interface{}{"status": "error", "message": "刷新 token 失败"}
+	}
+
+	userID := resolveUserID(sessionCookies, confirmedResp)
 	cred := utils.NewCredential(sessionCookies, "qr-login")
 	cred.UserID = userID
 	utils.SaveCredential(cred)
+
+	if userID != "" {
+		notify.sendText(fmt.Sprintf("闲鱼登录成功！用户ID: %s", userID))
+	} else {
+		notify.sendText("闲鱼登录成功（部分状态缺失，建议重新登录以获取完整状态）。")
+	}
 	return map[string]interface{}{"status": "confirmed", "user_id": userID}
 }
+
+// ---------------------------------------------------------------------------
+// Internal helpers
+// ---------------------------------------------------------------------------
 
 func (am *AuthManager) getLoginParams(client *http.Client, cookies map[string]string) map[string]string {
 	params := url.Values{}
@@ -298,9 +491,12 @@ func (am *AuthManager) generateQR(client *http.Client, loginParams map[string]st
 	return nil
 }
 
-func (am *AuthManager) pollQRStatus(client *http.Client, loginParams map[string]string, cookies map[string]string) map[string]string {
+// pollQRStatusWithNotify polls QR status and sends notifications on state changes.
+// Returns (cookies, confirmedResponse) — confirmedResponse is kept for s_tag extraction.
+func (am *AuthManager) pollQRStatusWithNotify(client *http.Client, loginParams map[string]string, cookies map[string]string, notify notifyConfig) (map[string]string, *http.Response) {
 	start := time.Now()
 	scanned := false
+	consecutiveErrors := 0
 
 	for time.Since(start) < qrTimeout {
 		time.Sleep(qrPollInterval)
@@ -317,14 +513,23 @@ func (am *AuthManager) pollQRStatus(client *http.Client, loginParams map[string]
 
 		resp, err := client.Do(req)
 		if err != nil {
+			consecutiveErrors++
+			if consecutiveErrors >= 10 {
+				msg := fmt.Sprintf("轮询网络失败过多: %s", err)
+				fmt.Fprintln(os.Stderr, utils.Red.Sprint(msg))
+				notify.sendText("闲鱼登录失败：" + msg)
+				return nil, nil
+			}
 			continue
 		}
+		consecutiveErrors = 0
 
 		body, _ := io.ReadAll(resp.Body)
-		resp.Body.Close()
+		// Don't close resp.Body for CONFIRMED — we need resp for s_tag extraction
 
 		var result map[string]interface{}
 		if json.Unmarshal(body, &result) != nil {
+			resp.Body.Close()
 			continue
 		}
 
@@ -332,14 +537,16 @@ func (am *AuthManager) pollQRStatus(client *http.Client, loginParams map[string]
 		data, _ := content["data"].(map[string]interface{})
 		status, _ := data["qrCodeStatus"].(string)
 
-		switch status {
+		switch strings.ToUpper(strings.TrimSpace(status)) {
 		case "NEW":
-			// Still waiting
-		case "SCANED":
+			resp.Body.Close()
+		case "SCANED", "SCANNED":
 			if !scanned {
 				scanned = true
 				fmt.Fprintln(os.Stderr, utils.Yellow.Sprint("已扫码，请在手机上确认登录"))
+				notify.sendText("已扫码，请在闲鱼 App 上确认登录。")
 			}
+			resp.Body.Close()
 		case "CONFIRMED":
 			resultCookies := make(map[string]string)
 			collectSetCookies(resp, resultCookies)
@@ -347,8 +554,13 @@ func (am *AuthManager) pollQRStatus(client *http.Client, loginParams map[string]
 			if token, ok := data["token"].(string); ok {
 				resultCookies["token"] = token
 			}
+			for _, key := range []string{"unb", "userId", "userid", "uid", "nick", "nickname"} {
+				if v, ok := data[key]; ok && v != nil && fmt.Sprint(v) != "" {
+					resultCookies[key] = fmt.Sprint(v)
+				}
+			}
 
-			// Follow returnUrl
+			// Follow returnUrl to get full session cookies
 			if returnURL, ok := data["returnUrl"].(string); ok && returnURL != "" {
 				merged := make(map[string]string)
 				for k, v := range cookies {
@@ -367,32 +579,44 @@ func (am *AuthManager) pollQRStatus(client *http.Client, loginParams map[string]
 					redirectResp.Body.Close()
 				}
 			}
-			return resultCookies
+			return resultCookies, resp
 
 		case "EXPIRED":
+			resp.Body.Close()
 			fmt.Fprintln(os.Stderr, utils.Red.Sprint("二维码已过期，请重新登录"))
-			return nil
-		case "CANCELLED":
+			notify.sendText("闲鱼登录二维码已过期，请重新发起登录。")
+			return nil, nil
+		case "CANCELLED", "CANCELED":
+			resp.Body.Close()
 			fmt.Fprintln(os.Stderr, utils.Red.Sprint("登录已取消"))
-			return nil
+			notify.sendText("闲鱼登录已取消。")
+			return nil, nil
+		default:
+			resp.Body.Close()
 		}
 
 		// Check for risk control
 		if iframeRedirect, ok := data["iframeRedirect"].(bool); ok && iframeRedirect {
 			redirectURL, _ := data["iframeRedirectUrl"].(string)
 			fmt.Fprintln(os.Stderr, utils.Red.Sprint("需要风控验证，请在浏览器中完成验证后重试"))
+			msg := "闲鱼登录需要风控验证。"
 			if redirectURL != "" {
 				fmt.Fprintln(os.Stderr, utils.Yellow.Sprintf("验证链接: %s", redirectURL))
+				msg += " 验证链接: " + redirectURL
 			}
 			fmt.Fprintln(os.Stderr, utils.Dim.Sprint("验证后可使用 xianyu login --cookie 登录"))
-			return nil
+			notify.sendText(msg)
+			return nil, nil
 		}
 	}
 
 	fmt.Fprintln(os.Stderr, utils.Red.Sprint("登录超时（5分钟），请重试"))
-	return nil
+	notify.sendText("闲鱼登录等待超时，请重试。")
+	return nil, nil
 }
 
+// refreshMH5TK refreshes the _m_h5_tk token and also tries to recover user_id
+// from the response s_tag header (which contains it once the session is established).
 func refreshMH5TK(cookies map[string]string) {
 	cookieHeader := utils.BuildCookieHeader(cookies)
 	headers := utils.DefaultHeaders()
@@ -435,6 +659,13 @@ func refreshMH5TK(cookies map[string]string) {
 			continue
 		}
 		collectSetCookies(resp, cookies)
+		// Also try to recover user_id from s_tag in the refresh response
+		if cookies["unb"] == "" {
+			if uid := extractUserIDFromSTag(resp); uid != "" {
+				cookies["unb"] = uid
+				log.Printf("Recovered unb=%s from token refresh s_tag", uid)
+			}
+		}
 		resp.Body.Close()
 		cookieHeader = utils.BuildCookieHeader(cookies)
 	}
@@ -507,12 +738,9 @@ func collectSetCookies(resp *http.Response, target map[string]string) {
 }
 
 // jsonValToStr converts a JSON-decoded value to string without scientific notation.
-// Go's json.Unmarshal decodes numbers as float64, and fmt.Sprint(float64) produces
-// scientific notation for large numbers (e.g. "1.71e+12" instead of "1710000000000").
 func jsonValToStr(v interface{}) string {
 	switch val := v.(type) {
 	case float64:
-		// Use %.0f to avoid scientific notation for integer-like floats
 		if val == float64(int64(val)) {
 			return fmt.Sprintf("%.0f", val)
 		}

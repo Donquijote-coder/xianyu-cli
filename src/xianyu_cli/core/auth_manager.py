@@ -105,6 +105,15 @@ class AuthManager:
         Returns:
             Credential on success, None on failure/timeout.
         """
+        try:
+            return await self._qr_login_impl()
+        except Exception as exc:
+            logger.error("qr_login failed with unexpected error: %s", exc, exc_info=True)
+            console.print(f"[red]登录过程异常: {exc}[/red]")
+            return None
+
+    async def _qr_login_impl(self) -> Credential | None:
+        """Internal implementation of QR login flow."""
         async with httpx.AsyncClient(
             follow_redirects=True,
             timeout=30.0,
@@ -191,6 +200,14 @@ class AuthManager:
 
         This method blocks until login completes or times out.
         """
+        try:
+            return await self._qr_login_json_impl()
+        except Exception as exc:
+            logger.error("qr_login_json failed: %s", exc, exc_info=True)
+            return {"status": "error", "message": f"登录过程异常: {exc}"}
+
+    async def _qr_login_json_impl(self) -> dict:
+        """Internal implementation of JSON QR login flow."""
         async with httpx.AsyncClient(
             follow_redirects=True,
             timeout=30.0,
@@ -300,7 +317,11 @@ class AuthManager:
             "rnd": str(random()),
         }
 
-        resp = await client.get(_QR_LOGIN_PAGE_URL, params=params, cookies=cookies)
+        try:
+            resp = await client.get(_QR_LOGIN_PAGE_URL, params=params, cookies=cookies)
+        except Exception as exc:
+            logger.error("Failed to fetch login page: %s", exc, exc_info=True)
+            return None
 
         # Collect cookies from login page (XSRF-TOKEN, _tb_token_, etc.)
         for k, v in resp.cookies.items():
@@ -333,8 +354,17 @@ class AuthManager:
 
         Returns dict with keys: codeContent, t, ck, resultCode, processFinished
         """
-        resp = await client.get(_QR_GENERATE_URL, params=login_params)
-        body = resp.json()
+        try:
+            resp = await client.get(_QR_GENERATE_URL, params=login_params)
+        except Exception as exc:
+            logger.error("Failed to generate QR code: %s", exc, exc_info=True)
+            return None
+
+        try:
+            body = resp.json()
+        except Exception:
+            logger.error("QR generate non-JSON response (HTTP %d): %s", resp.status_code, resp.text[:200])
+            return None
 
         content = body.get("content", {})
         if content.get("success"):
@@ -352,48 +382,91 @@ class AuthManager:
         """Poll QR code status until confirmed, expired, or timeout."""
         start = time.time()
         scanned = False
+        poll_count = 0
+        consecutive_errors = 0
+        _MAX_CONSECUTIVE_ERRORS = 10
 
         while time.time() - start < _QR_TIMEOUT:
             await asyncio.sleep(_QR_POLL_INTERVAL)
+            poll_count += 1
+            elapsed = time.time() - start
 
-            resp = await client.post(
-                _QR_QUERY_URL,
-                data=login_params,
-                cookies=cookies,
-            )
+            # --- HTTP request with retry on transient errors ---
+            try:
+                resp = await client.post(
+                    _QR_QUERY_URL,
+                    data=login_params,
+                    cookies=cookies,
+                )
+                consecutive_errors = 0  # reset on success
+            except (httpx.TimeoutException, httpx.NetworkError) as exc:
+                consecutive_errors += 1
+                logger.warning(
+                    "QR poll #%d network error (%d consecutive): %s",
+                    poll_count, consecutive_errors, exc,
+                )
+                if consecutive_errors >= _MAX_CONSECUTIVE_ERRORS:
+                    logger.error(
+                        "QR poll aborting after %d consecutive network errors",
+                        consecutive_errors,
+                    )
+                    console.print("[red]网络连续失败，轮询终止[/red]")
+                    return None
+                # Back off a bit before retrying
+                await asyncio.sleep(min(2.0 * consecutive_errors, 10.0))
+                continue
+            except Exception as exc:
+                logger.error("QR poll #%d unexpected error: %s", poll_count, exc, exc_info=True)
+                console.print(f"[red]轮询异常: {exc}[/red]")
+                return None
 
             # Handle non-JSON responses gracefully
             try:
                 body = resp.json()
             except Exception:
-                logger.debug("QR poll non-JSON response: %s", resp.text[:200])
+                logger.debug("QR poll #%d non-JSON response (HTTP %d): %s", poll_count, resp.status_code, resp.text[:200])
                 continue
 
-            status = body.get("content", {}).get("data", {}).get("qrCodeStatus", "")
+            data = body.get("content", {}).get("data", {})
+            raw_status = data.get("qrCodeStatus", "")
+            status = str(raw_status or "").strip().upper()
+
+            if poll_count % 10 == 1:
+                # Log progress every ~8 seconds
+                logger.debug(
+                    "QR poll #%d elapsed=%.1fs status=%r scanned=%s",
+                    poll_count, elapsed, status, scanned,
+                )
 
             if status == "NEW":
                 pass  # Still waiting for scan
-            elif status == "SCANED" and not scanned:
-                scanned = True
-                console.print("[yellow]已扫码，请在手机上确认登录[/yellow]")
+            elif status in {"SCANED", "SCANNED"}:
+                if not scanned:
+                    scanned = True
+                    console.print("[yellow]已扫码，请在手机上确认登录[/yellow]")
+                    logger.info("QR scanned at poll #%d (%.1fs)", poll_count, elapsed)
+                # After scan, keep polling for CONFIRMED — do NOT fall through
             elif status == "CONFIRMED":
+                logger.info("QR confirmed at poll #%d (%.1fs)", poll_count, elapsed)
                 # Extract cookies from response (use both methods)
                 result_cookies: dict[str, str] = {}
                 _collect_set_cookies(resp, result_cookies)
 
-                # Also check response data for tokens
-                data = body.get("content", {}).get("data", {})
+                # Also check response data for tokens / identifiers
                 if "token" in data:
                     result_cookies["token"] = data["token"]
+                for key in ("unb", "userId", "userid", "uid", "nick", "nickname"):
+                    if key in data and data[key]:
+                        result_cookies[key] = str(data[key])
 
                 logger.debug("CONFIRMED response data keys: %s", list(data.keys()))
                 logger.debug("CONFIRMED cookies so far: %s", list(result_cookies.keys()))
 
                 # Critical: follow returnUrl to get full session cookies (incl. unb/user_id)
                 # Real browsers redirect to this URL after CONFIRMED to receive all cookies
-                return_url = data.get("returnUrl", "")
+                return_url = data.get("returnUrl", "") or data.get("url", "")
                 if return_url:
-                    logger.debug("Following returnUrl: %s", return_url[:80])
+                    logger.debug("Following returnUrl: %s", return_url[:120])
                     # Merge current cookies for the follow-up request
                     merged = {**cookies, **result_cookies}
                     try:
@@ -404,30 +477,46 @@ class AuthManager:
                         )
                         _collect_set_cookies(redirect_resp, result_cookies)
                         logger.debug(
-                            "After returnUrl: cookies=%s, status=%d",
+                            "After returnUrl: cookies=%s, status=%d final_url=%s",
                             list(result_cookies.keys()),
                             redirect_resp.status_code,
+                            str(redirect_resp.url)[:120],
                         )
                     except Exception as exc:
                         logger.warning("Failed to follow returnUrl: %s", exc)
 
+                # Some flows only set cookies in the client's jar after confirmation.
+                # Merge them as a last resort before returning.
+                for k, v in client.cookies.items():
+                    result_cookies.setdefault(k, v)
+                logger.debug("CONFIRMED final cookie keys: %s", list(result_cookies.keys()))
+
                 return result_cookies
             elif status == "EXPIRED":
+                logger.info("QR expired at poll #%d (%.1fs)", poll_count, elapsed)
                 console.print("[red]二维码已过期，请重新登录[/red]")
                 return None
-            elif status == "CANCELLED":
+            elif status in {"CANCELLED", "CANCELED"}:
+                logger.info("QR cancelled at poll #%d (%.1fs)", poll_count, elapsed)
                 console.print("[red]登录已取消[/red]")
                 return None
+            elif status:
+                # Unknown status — log it so we can diagnose
+                logger.warning(
+                    "QR poll #%d unknown status=%r data_keys=%s",
+                    poll_count, status, list(data.keys()),
+                )
 
             # Check for risk control (slider verification)
-            if body.get("content", {}).get("data", {}).get("iframeRedirect"):
-                redirect_url = body["content"]["data"].get("iframeRedirectUrl", "")
+            if data.get("iframeRedirect"):
+                redirect_url = data.get("iframeRedirectUrl", "")
                 console.print("[red]需要风控验证，请在浏览器中完成验证后重试[/red]")
                 if redirect_url:
                     console.print(f"[yellow]验证链接: {redirect_url}[/yellow]")
                 console.print("[dim]验证后可使用 xianyu login --cookie-source chrome 登录[/dim]")
                 return None
 
+        logger.info("QR poll timed out after %d polls (%.1fs)", poll_count, time.time() - start)
         console.print("[red]登录超时（5分钟），请重试[/red]")
         return None
 

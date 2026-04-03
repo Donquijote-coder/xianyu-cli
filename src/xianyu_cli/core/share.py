@@ -77,12 +77,8 @@ def _extract_share_text(detail: dict[str, Any]) -> str:
     title = (item_do.get("title") or "")[:60]
     price = item_do.get("soldPrice") or item_do.get("defaultPrice") or ""
     if price:
-        # soldPrice is in fen (cents), convert to yuan
-        try:
-            price_yuan = int(price) / 100
-            price_str = f"¥{price_yuan:.2f}"
-        except (ValueError, TypeError):
-            price_str = f"¥{price}"
+        # soldPrice is already in yuan (元)
+        price_str = f"¥{price}"
     else:
         price_str = ""
 

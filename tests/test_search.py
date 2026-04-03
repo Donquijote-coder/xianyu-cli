@@ -8,7 +8,7 @@ def test_parse_search_items(mock_api_response):
     assert len(items) == 1
     assert items[0]["id"] == "123456"
     assert items[0]["title"] == "iPhone 15 Pro 256G"
-    assert items[0]["price"] == "5999.00"  # 599900 cents → ¥5999.00
+    assert items[0]["price"] == "5999"  # soldPrice is in yuan
     assert items[0]["location"] == "杭州"
     assert items[0]["seller_name"] == "测试卖家"
 
