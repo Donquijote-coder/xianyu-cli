@@ -168,6 +168,9 @@ func (c *GoofishApiClient) doRequest(api, dataStr, version string) (map[string]i
 	}
 	defer resp.Body.Close()
 
+	// Capture Set-Cookie headers to update cookies (especially unb)
+	collectSetCookies(resp, c.Cookies)
+
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, err

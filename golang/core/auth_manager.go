@@ -9,6 +9,7 @@ import (
 	"log"
 	"math/rand"
 	"net/http"
+	"net/http/cookiejar"
 	"net/url"
 	"os"
 	"os/exec"
@@ -169,9 +170,54 @@ func newHTTPClient() *http.Client {
 			transport.Proxy = http.ProxyURL(proxyURL)
 		}
 	}
+	// No cookie jar here — the login flow manages cookies manually via
+	// Cookie headers to avoid duplicate/stale cookies. Use newJarClient()
+	// specifically for redirect-following requests where intermediate
+	// Set-Cookie headers need to be captured.
 	return &http.Client{
 		Transport: transport,
 		Timeout:   30 * time.Second,
+	}
+}
+
+// newJarClient creates an HTTP client with a cookie jar, used specifically
+// for following redirects where intermediate Set-Cookie headers must be captured.
+// Seeds the jar on all relevant Goofish domains plus any additional URLs provided,
+// so cookies are sent regardless of which host the returnUrl starts on.
+func newJarClient(cookies map[string]string, extraSeedURLs ...string) *http.Client {
+	transport := &http.Transport{
+		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+	}
+	if utils.ProxyURL != "" {
+		proxyURL, err := url.Parse(utils.ProxyURL)
+		if err == nil {
+			transport.Proxy = http.ProxyURL(proxyURL)
+		}
+	}
+	jar, _ := cookiejar.New(nil)
+	var jarCookies []*http.Cookie
+	for k, v := range cookies {
+		jarCookies = append(jarCookies, &http.Cookie{Name: k, Value: v})
+	}
+	// Seed on known Goofish domains + caller-provided URLs
+	seedHosts := []string{
+		"https://passport.goofish.com/",
+		"https://www.goofish.com/",
+		"https://login.goofish.com/",
+		"https://goofish.com/",
+		"https://h5api.m.goofish.com/",
+	}
+	seedHosts = append(seedHosts, extraSeedURLs...)
+	for _, host := range seedHosts {
+		u, err := url.Parse(host)
+		if err == nil {
+			jar.SetCookies(u, jarCookies)
+		}
+	}
+	return &http.Client{
+		Transport: transport,
+		Timeout:   30 * time.Second,
+		Jar:       jar,
 	}
 }
 
@@ -205,7 +251,13 @@ func refreshMH5TKWithRetry(cookies map[string]string) bool {
 	return false
 }
 
-// resolveUserID tries to find the user ID from cookies and response headers.
+// resolveUserID tries to find the user ID from cookies, response headers, and API calls.
+// RecoverUserID attempts to recover user_id from existing cookies via API calls.
+// Exported for use by the status command.
+func RecoverUserID(cookies map[string]string) string {
+	return recoverUserIDViaAPI(cookies)
+}
+
 func resolveUserID(cookies map[string]string, confirmedResp *http.Response) string {
 	// Try cookie fields first
 	for _, key := range []string{"unb", "userId", "userid", "uid"} {
@@ -213,10 +265,151 @@ func resolveUserID(cookies map[string]string, confirmedResp *http.Response) stri
 			return v
 		}
 	}
-	// Fallback: extract from s_tag header
+	// Fallback 1: extract from s_tag header
 	if uid := extractUserIDFromSTag(confirmedResp); uid != "" {
 		cookies["unb"] = uid
 		return uid
+	}
+	// Fallback 2: make a lightweight API call to recover user_id
+	// Delay to avoid RGV587 rate limiting right after login
+	time.Sleep(3 * time.Second)
+	if uid := recoverUserIDViaAPI(cookies); uid != "" {
+		cookies["unb"] = uid
+		return uid
+	}
+	return ""
+}
+
+// recoverUserIDViaAPI makes a lightweight API call to extract user_id from
+// the response's s_tag header or response data.
+func recoverUserIDViaAPI(cookies map[string]string) string {
+	// Try multiple lightweight APIs in sequence with small delays.
+	// Use APIs known to exist; the message token API often includes user_id.
+	apis := []string{
+		"mtop.taobao.idlemessage.pc.login.token",
+		"mtop.taobao.idle.pc.detail",
+	}
+
+	apiClient := NewGoofishApiClient(cookies)
+
+	for i, api := range apis {
+		if i > 0 {
+			time.Sleep(2 * time.Second)
+		}
+		result, err := apiClient.Call(api, nil, "")
+		// Check if API response set unb cookie (captured by apiClient)
+		if uid := apiClient.Cookies["unb"]; uid != "" {
+			log.Printf("Recovered user_id=%s via Set-Cookie from %s", uid, api)
+			cookies["unb"] = uid
+			return uid
+		}
+		if err != nil {
+			log.Printf("user_id recovery via %s failed: %s", api, err)
+			continue
+		}
+		if result != nil {
+			if uid := extractUserIDFromData(result); uid != "" {
+				log.Printf("Recovered user_id=%s via %s API data", uid, api)
+				return uid
+			}
+		}
+	}
+
+	// Fallback: make a direct signed request and check the s_tag header + body.
+	client := newHTTPClient()
+	t := GetTimestamp()
+	dataStr := "{}"
+	sign := GenerateSign(apiClient.Token(), t, dataStr)
+
+	params := url.Values{}
+	params.Set("jsv", "2.7.2")
+	params.Set("appKey", utils.AppKey)
+	params.Set("t", t)
+	params.Set("sign", sign)
+	params.Set("type", "originaljson")
+	params.Set("dataType", "json")
+	params.Set("data", dataStr)
+
+	reqURL := fmt.Sprintf("%s/mtop.gaia.nodejs.gaia.idle.data.gw.v2.index.get/1.0/?%s",
+		utils.APIBaseURL, params.Encode())
+	req, _ := http.NewRequest("GET", reqURL, nil)
+	setDefaultHeaders(req)
+	req.Header.Set("Cookie", utils.BuildCookieHeader(apiClient.Cookies))
+	req.Header.Set("Referer", "https://www.goofish.com/")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return ""
+	}
+	defer resp.Body.Close()
+
+	// Check Set-Cookie for unb
+	cookieMap := make(map[string]string)
+	collectSetCookies(resp, cookieMap)
+	if uid := cookieMap["unb"]; uid != "" {
+		log.Printf("Recovered user_id=%s via Set-Cookie unb", uid)
+		cookies["unb"] = uid
+		return uid
+	}
+
+	// Check s_tag header
+	if uid := extractUserIDFromSTag(resp); uid != "" {
+		log.Printf("Recovered user_id=%s via API response s_tag", uid)
+		return uid
+	}
+
+	// Parse response body for user_id
+	body, _ := io.ReadAll(resp.Body)
+	var fullResp map[string]interface{}
+	if json.Unmarshal(body, &fullResp) == nil {
+		if data, ok := fullResp["data"].(map[string]interface{}); ok {
+			if uid := extractUserIDFromData(data); uid != "" {
+				log.Printf("Recovered user_id=%s via raw API response body", uid)
+				return uid
+			}
+		}
+	}
+
+	// Last resort: visit goofish.com homepage with jar client to collect unb cookie
+	merged := make(map[string]string)
+	for k, v := range cookies {
+		merged[k] = v
+	}
+	jarClient := newJarClient(merged, "https://www.goofish.com/")
+	homeReq, _ := http.NewRequest("GET", "https://www.goofish.com/", nil)
+	setDefaultHeaders(homeReq)
+	homeResp, err := jarClient.Do(homeReq)
+	if err == nil {
+		homeCookies := make(map[string]string)
+		collectSetCookies(homeResp, homeCookies)
+		drainJarCookies(jarClient, homeCookies, "https://www.goofish.com/")
+		homeResp.Body.Close()
+		if uid := homeCookies["unb"]; uid != "" {
+			log.Printf("Recovered user_id=%s via goofish.com homepage cookies", uid)
+			cookies["unb"] = uid
+			return uid
+		}
+	}
+
+	return ""
+}
+
+// extractUserIDFromData searches a map for user_id under various keys.
+func extractUserIDFromData(data map[string]interface{}) string {
+	for _, key := range []string{"userId", "user_id", "uid", "tbUserId", "loginId", "sellerId"} {
+		if v, ok := data[key]; ok && fmt.Sprint(v) != "" && fmt.Sprint(v) != "0" {
+			return fmt.Sprint(v)
+		}
+	}
+	// Check nested userInfo / userDTO
+	for _, nested := range []string{"userInfo", "userDTO", "user"} {
+		if sub, ok := data[nested].(map[string]interface{}); ok {
+			for _, key := range []string{"userId", "user_id", "uid", "tbUserId"} {
+				if v, ok := sub[key]; ok && fmt.Sprint(v) != "" && fmt.Sprint(v) != "0" {
+					return fmt.Sprint(v)
+				}
+			}
+		}
 	}
 	return ""
 }
@@ -281,7 +474,7 @@ func (am *AuthManager) QRLogin() *utils.Credential {
 		return nil
 	}
 
-	// Merge cookies
+	// Merge cookies (including any captured by the jar during redirects)
 	for k, v := range resultCookies {
 		sessionCookies[k] = v
 	}
@@ -310,8 +503,8 @@ func (am *AuthManager) QRLogin() *utils.Credential {
 	utils.SaveCredential(cred)
 
 	if userID == "" {
-		fmt.Fprintln(os.Stderr, utils.Yellow.Sprint("登录成功（部分状态缺失，建议重新登录）"))
-		notify.sendText("闲鱼登录成功（部分状态缺失，建议重新登录以获取完整状态）。")
+		fmt.Fprintln(os.Stderr, utils.Yellow.Sprint("登录成功（用户ID未知，功能不受影响）"))
+		notify.sendText("闲鱼登录成功！（用户ID暂时未获取，不影响正常使用）")
 	} else {
 		fmt.Fprintln(os.Stderr, utils.Green.Sprintf("登录成功！用户ID: %s", userID))
 		notify.sendText(fmt.Sprintf("闲鱼登录成功！用户ID: %s", userID))
@@ -400,7 +593,7 @@ func (am *AuthManager) QRLoginJSON() map[string]interface{} {
 	if userID != "" {
 		notify.sendText(fmt.Sprintf("闲鱼登录成功！用户ID: %s", userID))
 	} else {
-		notify.sendText("闲鱼登录成功（部分状态缺失，建议重新登录以获取完整状态）。")
+		notify.sendText("闲鱼登录成功！（用户ID暂时未获取，不影响正常使用）")
 	}
 	return map[string]interface{}{"status": "confirmed", "user_id": userID}
 }
@@ -560,25 +753,21 @@ func (am *AuthManager) pollQRStatusWithNotify(client *http.Client, loginParams m
 				}
 			}
 
-			// Follow returnUrl to get full session cookies
+			// Follow returnUrl using a jar-enabled client to capture
+			// Set-Cookie headers from intermediate redirects.
 			if returnURL, ok := data["returnUrl"].(string); ok && returnURL != "" {
-				merged := make(map[string]string)
-				for k, v := range cookies {
-					merged[k] = v
-				}
-				for k, v := range resultCookies {
-					merged[k] = v
-				}
-
+				merged := mergeMaps(cookies, resultCookies)
+				jarClient := newJarClient(merged, returnURL)
 				redirectReq, _ := http.NewRequest("GET", returnURL, nil)
 				setDefaultHeaders(redirectReq)
-				redirectReq.Header.Set("Cookie", utils.BuildCookieHeader(merged))
-				redirectResp, err := client.Do(redirectReq)
+				redirectResp, err := jarClient.Do(redirectReq)
 				if err == nil {
 					collectSetCookies(redirectResp, resultCookies)
 					redirectResp.Body.Close()
 				}
+				drainJarCookies(jarClient, resultCookies, returnURL)
 			}
+
 			return resultCookies, resp
 
 		case "EXPIRED":
@@ -617,9 +806,14 @@ func (am *AuthManager) pollQRStatusWithNotify(client *http.Client, loginParams m
 
 // refreshMH5TK refreshes the _m_h5_tk token and also tries to recover user_id
 // from the response s_tag header (which contains it once the session is established).
+// refreshMH5TK refreshes the _m_h5_tk token and also tries to recover user_id
+// from the response s_tag header (which contains it once the session is established).
+// Always makes at least one request even if _m_h5_tk exists, so we can recover unb.
 func refreshMH5TK(cookies map[string]string) {
 	cookieHeader := utils.BuildCookieHeader(cookies)
 	headers := utils.DefaultHeaders()
+	needToken := cookies["_m_h5_tk"] == ""
+	needUserID := cookies["unb"] == ""
 
 	mtopParams := url.Values{}
 	mtopParams.Set("jsv", "2.7.2")
@@ -636,7 +830,11 @@ func refreshMH5TK(cookies map[string]string) {
 	client := newHTTPClient()
 
 	for _, u := range refreshURLs {
-		if _, ok := cookies["_m_h5_tk"]; ok {
+		// Stop early only if we have both token and user_id
+		if !needToken && !needUserID {
+			break
+		}
+		if cookies["_m_h5_tk"] != "" && cookies["unb"] != "" {
 			break
 		}
 
@@ -659,12 +857,16 @@ func refreshMH5TK(cookies map[string]string) {
 			continue
 		}
 		collectSetCookies(resp, cookies)
-		// Also try to recover user_id from s_tag in the refresh response
+		// Try to recover user_id from s_tag in the refresh response
 		if cookies["unb"] == "" {
 			if uid := extractUserIDFromSTag(resp); uid != "" {
 				cookies["unb"] = uid
+				needUserID = false
 				log.Printf("Recovered unb=%s from token refresh s_tag", uid)
 			}
+		}
+		if cookies["_m_h5_tk"] != "" {
+			needToken = false
 		}
 		resp.Body.Close()
 		cookieHeader = utils.BuildCookieHeader(cookies)
@@ -709,6 +911,34 @@ func setDefaultHeaders(req *http.Request) {
 	for k, vals := range utils.DefaultHeaders() {
 		for _, v := range vals {
 			req.Header.Set(k, v)
+		}
+	}
+}
+
+// drainJarCookies extracts cookies from the client's cookie jar for all known
+// Goofish domains plus any extra URLs. Pass the returnUrl or other redirect
+// targets to capture cookies from non-standard hosts.
+func drainJarCookies(client *http.Client, target map[string]string, extraURLs ...string) {
+	if client.Jar == nil {
+		return
+	}
+	hosts := []string{
+		"https://passport.goofish.com/",
+		"https://www.goofish.com/",
+		"https://login.goofish.com/",
+		"https://h5api.m.goofish.com/",
+		"https://goofish.com/",
+	}
+	hosts = append(hosts, extraURLs...)
+	for _, rawURL := range hosts {
+		u, err := url.Parse(rawURL)
+		if err != nil {
+			continue
+		}
+		for _, c := range client.Jar.Cookies(u) {
+			if c.Value != "" {
+				target[c.Name] = c.Value
+			}
 		}
 	}
 }

@@ -17,6 +17,7 @@ var loginCmd = &cobra.Command{
 	Run: func(cmd *cobra.Command, args []string) {
 		cookieSource, _ := cmd.Flags().GetString("cookie-source")
 		cookie, _ := cmd.Flags().GetString("cookie")
+		daemon, _ := cmd.Flags().GetBool("daemon")
 
 		// Direct cookie string import
 		if cookie != "" {
@@ -58,6 +59,29 @@ var loginCmd = &cobra.Command{
 			return
 		}
 
+		// Daemon mode: generate QR, spawn background poller, return immediately.
+		// Designed for agent/bot invocations (Telegram, WeChat, etc.).
+		if daemon {
+			result := auth.QRLoginDaemon()
+			status, _ := result["status"].(string)
+			if status == "qr_ready" {
+				if outputMode == "rich" {
+					// In rich mode, show QR details so the caller can see them
+					// even when notifications are not configured.
+					fmt.Fprintln(os.Stderr, utils.Green.Sprint("✓ 二维码已生成，后台正在等待扫码确认"))
+					if qrPath, ok := result["qr_path"].(string); ok && qrPath != "" {
+						fmt.Fprintf(os.Stderr, "  二维码路径: %s\n", qrPath)
+					}
+				}
+				models.OK(result).Emit(outputMode)
+			} else {
+				msg, _ := result["message"].(string)
+				models.Fail(msg).Emit(outputMode)
+			}
+			return
+		}
+
+		// JSON mode: synchronous login, returns after QR confirmed
 		if outputMode == "json" {
 			result := auth.QRLoginJSON()
 			if result["status"] == "confirmed" {
@@ -69,18 +93,32 @@ var loginCmd = &cobra.Command{
 				msg, _ := result["message"].(string)
 				models.Fail(msg).Emit(outputMode)
 			}
-		} else {
-			fmt.Fprintln(os.Stderr, utils.Dim.Sprint("正在启动QR码登录..."))
-			cred := auth.QRLogin()
-			if cred != nil {
-				models.OK(map[string]interface{}{
-					"message": "QR码登录成功",
-					"user_id": cred.UserID,
-				}).Emit(outputMode)
-			} else {
-				models.Fail("登录失败，请重试").Emit(outputMode)
-			}
+			return
 		}
+
+		// Foreground mode: interactive terminal login
+		fmt.Fprintln(os.Stderr, utils.Dim.Sprint("正在启动QR码登录..."))
+		cred = auth.QRLogin()
+		if cred != nil {
+			models.OK(map[string]interface{}{
+				"message": "QR码登录成功",
+				"user_id": cred.UserID,
+			}).Emit(outputMode)
+		} else {
+			models.Fail("登录失败，请重试").Emit(outputMode)
+		}
+	},
+}
+
+// loginPollCmd is a hidden subcommand used by the daemon mode.
+// It reads login state from a file and polls for QR confirmation in the background.
+var loginPollCmd = &cobra.Command{
+	Use:    "login-poll [state-file]",
+	Short:  "后台轮询QR登录状态（内部使用）",
+	Hidden: true,
+	Args:   cobra.ExactArgs(1),
+	Run: func(cmd *cobra.Command, args []string) {
+		core.RunPollDaemon(args[0])
 	},
 }
 
@@ -101,6 +139,8 @@ var statusCmd = &cobra.Command{
 	Use:   "status",
 	Short: "查看当前登录状态",
 	Run: func(cmd *cobra.Command, args []string) {
+		fixUserID, _ := cmd.Flags().GetBool("fix-userid")
+
 		cred := utils.LoadCredential()
 		if cred == nil {
 			if outputMode == "rich" {
@@ -112,6 +152,23 @@ var statusCmd = &cobra.Command{
 				}).Emit(outputMode)
 			}
 			return
+		}
+
+		// Auto-recover user_id if missing and we have a valid token
+		if (fixUserID || cred.UserID == "") && cred.MH5TK() != "" && !cred.IsExpired() {
+			if outputMode == "rich" {
+				fmt.Fprintln(os.Stderr, utils.Dim.Sprint("尝试恢复用户ID..."))
+			}
+			uid := core.RecoverUserID(cred.Cookies)
+			if uid != "" {
+				cred.UserID = uid
+				cred.Cookies["unb"] = uid
+				if err := utils.SaveCredential(cred); err == nil {
+					if outputMode == "rich" {
+						fmt.Fprintln(os.Stderr, utils.Green.Sprintf("✓ 已恢复用户ID: %s", uid))
+					}
+				}
+			}
 		}
 
 		expired := cred.IsExpired()
@@ -148,4 +205,6 @@ var statusCmd = &cobra.Command{
 func init() {
 	loginCmd.Flags().String("cookie-source", "", "从指定浏览器提取 Cookie 登录 (chrome/firefox/edge/safari/brave)")
 	loginCmd.Flags().String("cookie", "", "直接提供 Cookie 字符串登录")
+	loginCmd.Flags().Bool("daemon", false, "后台模式：生成二维码后立即返回，后台轮询扫码结果（适合 bot/agent 调用）")
+	statusCmd.Flags().Bool("fix-userid", false, "强制尝试恢复用户ID")
 }

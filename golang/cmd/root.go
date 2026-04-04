@@ -46,6 +46,7 @@ func init() {
 
 	// Register commands
 	rootCmd.AddCommand(loginCmd)
+	rootCmd.AddCommand(loginPollCmd)
 	rootCmd.AddCommand(logoutCmd)
 	rootCmd.AddCommand(statusCmd)
 	rootCmd.AddCommand(searchCmd)
