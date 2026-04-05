@@ -59,21 +59,24 @@ var loginCmd = &cobra.Command{
 			return
 		}
 
-		// Daemon mode: generate QR, spawn background poller, return immediately.
+		// Daemon mode: generate QR, start background goroutine to poll,
+		// output QR info immediately, then keep process alive until done.
 		// Designed for agent/bot invocations (Telegram, WeChat, etc.).
 		if daemon {
-			result := auth.QRLoginDaemon()
+			result, done := auth.QRLoginDaemon()
 			status, _ := result["status"].(string)
 			if status == "qr_ready" {
 				if outputMode == "rich" {
-					// In rich mode, show QR details so the caller can see them
-					// even when notifications are not configured.
 					fmt.Fprintln(os.Stderr, utils.Green.Sprint("✓ 二维码已生成，后台正在等待扫码确认"))
 					if qrPath, ok := result["qr_path"].(string); ok && qrPath != "" {
 						fmt.Fprintf(os.Stderr, "  二维码路径: %s\n", qrPath)
 					}
 				}
 				models.OK(result).Emit(outputMode)
+				// Close stdout so the caller (bash tool) sees output as complete,
+				// then keep the process alive for the background goroutine.
+				os.Stdout.Close()
+				<-done
 			} else {
 				msg, _ := result["message"].(string)
 				models.Fail(msg).Emit(outputMode)
@@ -107,18 +110,6 @@ var loginCmd = &cobra.Command{
 		} else {
 			models.Fail("登录失败，请重试").Emit(outputMode)
 		}
-	},
-}
-
-// loginPollCmd is a hidden subcommand used by the daemon mode.
-// It reads login state from a file and polls for QR confirmation in the background.
-var loginPollCmd = &cobra.Command{
-	Use:    "login-poll [state-file]",
-	Short:  "后台轮询QR登录状态（内部使用）",
-	Hidden: true,
-	Args:   cobra.ExactArgs(1),
-	Run: func(cmd *cobra.Command, args []string) {
-		core.RunPollDaemon(args[0])
 	},
 }
 

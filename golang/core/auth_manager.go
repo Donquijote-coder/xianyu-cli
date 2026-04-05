@@ -35,6 +35,22 @@ const (
 )
 
 // ---------------------------------------------------------------------------
+// Debug file logger — writes to /tmp/xianyu_login_debug.log for diagnosis
+// ---------------------------------------------------------------------------
+
+const loginDebugLog = "/tmp/xianyu_login_debug.log"
+
+func logDebug(format string, args ...interface{}) {
+	f, err := os.OpenFile(loginDebugLog, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	msg := fmt.Sprintf(format, args...)
+	fmt.Fprintf(f, "[%s] %s\n", time.Now().Format("2006-01-02 15:04:05"), msg)
+}
+
+// ---------------------------------------------------------------------------
 // Notification helpers — send messages to the user's chat channel via OpenClaw
 // ---------------------------------------------------------------------------
 
@@ -161,6 +177,8 @@ func (am *AuthManager) Logout() bool {
 }
 
 func newHTTPClient() *http.Client {
+	logDebug("newHTTPClient: XIANYU_PROXY_URL=%q, HTTP_PROXY=%q, HTTPS_PROXY=%q, ALL_PROXY=%q",
+		os.Getenv("XIANYU_PROXY_URL"), os.Getenv("HTTP_PROXY"), os.Getenv("HTTPS_PROXY"), os.Getenv("ALL_PROXY"))
 	transport := &http.Transport{
 		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
 	}
@@ -416,6 +434,7 @@ func extractUserIDFromData(data map[string]interface{}) string {
 
 // QRLogin performs QR code terminal login.
 func (am *AuthManager) QRLogin() *utils.Credential {
+	logDebug("=== QRLogin START (rich mode) ===")
 	notify := loadNotifyConfig()
 	client := newHTTPClient()
 	sessionCookies := make(map[string]string)
@@ -433,6 +452,7 @@ func (am *AuthManager) QRLogin() *utils.Credential {
 	}
 	collectSetCookies(resp, sessionCookies)
 	resp.Body.Close()
+	logDebug("Step1 cookies=%d, keys=%v", len(sessionCookies), cookieKeys(sessionCookies))
 
 	// Step 2: Get login page parameters
 	loginParams := am.getLoginParams(client, sessionCookies)
@@ -441,6 +461,8 @@ func (am *AuthManager) QRLogin() *utils.Credential {
 		notify.sendText("闲鱼登录失败：获取登录参数失败")
 		return nil
 	}
+	logDebug("Step2 loginParams keys=%v", paramKeys(loginParams))
+	logDebug("Step2 cookies=%d, keys=%v", len(sessionCookies), cookieKeys(sessionCookies))
 
 	// Step 3: Generate QR code
 	qrData := am.generateQR(client, loginParams)
@@ -478,12 +500,13 @@ func (am *AuthManager) QRLogin() *utils.Credential {
 	for k, v := range resultCookies {
 		sessionCookies[k] = v
 	}
+	logDebug("QRLogin: after merge, sessionCookies=%d, keys=%v", len(sessionCookies), cookieKeys(sessionCookies))
 
 	// Extract user_id from s_tag if unb missing
 	if sessionCookies["unb"] == "" && confirmedResp != nil {
 		if uid := extractUserIDFromSTag(confirmedResp); uid != "" {
 			sessionCookies["unb"] = uid
-			log.Printf("Extracted unb=%s from s_tag header", uid)
+			logDebug("QRLogin: extracted unb=%s from s_tag", uid)
 		}
 	}
 
@@ -514,6 +537,7 @@ func (am *AuthManager) QRLogin() *utils.Credential {
 
 // QRLoginJSON performs QR login returning JSON-friendly status.
 func (am *AuthManager) QRLoginJSON() map[string]interface{} {
+	logDebug("=== QRLoginJSON START (json mode) ===")
 	notify := loadNotifyConfig()
 	client := newHTTPClient()
 	sessionCookies := make(map[string]string)
@@ -571,21 +595,31 @@ func (am *AuthManager) QRLoginJSON() map[string]interface{} {
 	for k, v := range resultCookies {
 		sessionCookies[k] = v
 	}
+	logDebug("QRLoginJSON: after merge, sessionCookies=%d, keys=%v", len(sessionCookies), cookieKeys(sessionCookies))
 
 	// Extract user_id from s_tag if unb missing
 	if sessionCookies["unb"] == "" && confirmedResp != nil {
+		sTag := ""
+		if confirmedResp != nil {
+			sTag = confirmedResp.Header.Get("s_tag")
+		}
+		logDebug("QRLoginJSON: unb missing, s_tag=%q", sTag)
 		if uid := extractUserIDFromSTag(confirmedResp); uid != "" {
 			sessionCookies["unb"] = uid
+			logDebug("QRLoginJSON: extracted unb=%s from s_tag", uid)
 		}
 	}
 
 	// Refresh token with retry
+	logDebug("QRLoginJSON: refreshing token, current _m_h5_tk=%q", sessionCookies["_m_h5_tk"])
 	if !refreshMH5TKWithRetry(sessionCookies) {
 		notify.sendText("闲鱼登录失败：刷新 token 失败，请重新登录。")
 		return map[string]interface{}{"status": "error", "message": "刷新 token 失败"}
 	}
+	logDebug("QRLoginJSON: after refresh, cookies=%d, unb=%q", len(sessionCookies), sessionCookies["unb"])
 
 	userID := resolveUserID(sessionCookies, confirmedResp)
+	logDebug("QRLoginJSON: resolveUserID returned %q", userID)
 	cred := utils.NewCredential(sessionCookies, "qr-login")
 	cred.UserID = userID
 	utils.SaveCredential(cred)
@@ -629,20 +663,31 @@ func (am *AuthManager) getLoginParams(client *http.Client, cookies map[string]st
 	collectSetCookies(resp, cookies)
 
 	body, _ := io.ReadAll(resp.Body)
+	logDebug("getLoginParams: resp status=%d, body length=%d", resp.StatusCode, len(body))
 
 	re := regexp.MustCompile(`window\.viewData\s*=\s*(\{.*?\});`)
 	match := re.FindSubmatch(body)
 	if match == nil {
+		logDebug("getLoginParams: no viewData found in HTML")
+		// Log a snippet of the body for diagnosis
+		snippet := string(body)
+		if len(snippet) > 500 {
+			snippet = snippet[:500]
+		}
+		logDebug("getLoginParams: body snippet=%s", snippet)
 		return nil
 	}
+	logDebug("getLoginParams: viewData raw=%s", string(match[1]))
 
 	var viewData map[string]interface{}
 	if err := json.Unmarshal(match[1], &viewData); err != nil {
+		logDebug("getLoginParams: viewData parse error=%s", err)
 		return nil
 	}
 
 	formData, ok := viewData["loginFormData"].(map[string]interface{})
 	if !ok || formData == nil {
+		logDebug("getLoginParams: no loginFormData in viewData, keys=%v", dataKeys(viewData))
 		return nil
 	}
 
@@ -651,6 +696,7 @@ func (am *AuthManager) getLoginParams(client *http.Client, cookies map[string]st
 		result[k] = jsonValToStr(v)
 	}
 	result["umidTag"] = "SERVER"
+	logDebug("getLoginParams: umidToken=%s", result["umidToken"])
 	return result
 }
 
@@ -741,8 +787,28 @@ func (am *AuthManager) pollQRStatusWithNotify(client *http.Client, loginParams m
 			}
 			resp.Body.Close()
 		case "CONFIRMED":
+			logDebug("CONFIRMED: raw data keys=%v", dataKeys(data))
+
+			// Check for risk control BEFORE processing as a real confirmation.
+			// When iframeRedirect is true, the server requires verification —
+			// the response has no returnUrl, no token, no cookies.
+			if iframeRedirect, ok := data["iframeRedirect"].(bool); ok && iframeRedirect {
+				redirectURL, _ := data["iframeRedirectUrl"].(string)
+				logDebug("CONFIRMED but iframeRedirect=true, url=%s", redirectURL)
+				fmt.Fprintln(os.Stderr, utils.Red.Sprint("需要风控验证"))
+				msg := "闲鱼登录需要风控验证，请在浏览器中完成验证后重试。"
+				if redirectURL != "" {
+					fmt.Fprintln(os.Stderr, utils.Yellow.Sprintf("验证链接: %s", redirectURL))
+					msg += " 验证链接: " + redirectURL
+				}
+				notify.sendText(msg)
+				resp.Body.Close()
+				return nil, nil
+			}
+
 			resultCookies := make(map[string]string)
 			collectSetCookies(resp, resultCookies)
+			logDebug("CONFIRMED: Set-Cookie cookies=%d, keys=%v", len(resultCookies), cookieKeys(resultCookies))
 
 			if token, ok := data["token"].(string); ok {
 				resultCookies["token"] = token
@@ -750,24 +816,36 @@ func (am *AuthManager) pollQRStatusWithNotify(client *http.Client, loginParams m
 			for _, key := range []string{"unb", "userId", "userid", "uid", "nick", "nickname"} {
 				if v, ok := data[key]; ok && v != nil && fmt.Sprint(v) != "" {
 					resultCookies[key] = fmt.Sprint(v)
+					logDebug("CONFIRMED: found %s=%v in data", key, v)
 				}
 			}
 
 			// Follow returnUrl using a jar-enabled client to capture
 			// Set-Cookie headers from intermediate redirects.
 			if returnURL, ok := data["returnUrl"].(string); ok && returnURL != "" {
+				logDebug("CONFIRMED: following returnUrl=%s", returnURL)
 				merged := mergeMaps(cookies, resultCookies)
+				logDebug("CONFIRMED: merged cookies before redirect=%d", len(merged))
 				jarClient := newJarClient(merged, returnURL)
 				redirectReq, _ := http.NewRequest("GET", returnURL, nil)
 				setDefaultHeaders(redirectReq)
 				redirectResp, err := jarClient.Do(redirectReq)
 				if err == nil {
+					logDebug("CONFIRMED: redirect status=%d", redirectResp.StatusCode)
+					beforeCount := len(resultCookies)
 					collectSetCookies(redirectResp, resultCookies)
+					logDebug("CONFIRMED: redirect Set-Cookie added %d cookies", len(resultCookies)-beforeCount)
 					redirectResp.Body.Close()
+				} else {
+					logDebug("CONFIRMED: redirect error=%s", err)
 				}
 				drainJarCookies(jarClient, resultCookies, returnURL)
+				logDebug("CONFIRMED: after drainJar cookies=%d, keys=%v", len(resultCookies), cookieKeys(resultCookies))
+			} else {
+				logDebug("CONFIRMED: no returnUrl in data")
 			}
 
+			logDebug("CONFIRMED: final resultCookies=%d, has_unb=%v", len(resultCookies), resultCookies["unb"] != "")
 			return resultCookies, resp
 
 		case "EXPIRED":
@@ -941,6 +1019,30 @@ func drainJarCookies(client *http.Client, target map[string]string, extraURLs ..
 			}
 		}
 	}
+}
+
+func dataKeys(m map[string]interface{}) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	return keys
+}
+
+func paramKeys(m map[string]string) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	return keys
+}
+
+func cookieKeys(m map[string]string) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	return keys
 }
 
 func collectSetCookies(resp *http.Response, target map[string]string) {

@@ -8,7 +8,6 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -16,24 +15,19 @@ import (
 	"xianyu-cli/utils"
 )
 
-// daemonState is serialized to a temp file for the poll daemon to resume.
-type daemonState struct {
-	LoginParams    map[string]string `json:"login_params"`
-	SessionCookies map[string]string `json:"session_cookies"`
-	QRContent      string            `json:"qr_content"`
-	QRPath         string            `json:"qr_path"`
-	CreatedAt      int64             `json:"created_at"`
-}
+// qrImageDir is where QR images are saved.
+const qrImageDir = "/tmp/xianyu"
 
-// daemonStateDir is where per-attempt state files are written.
-const daemonStateDir = "/tmp/xianyu"
-
-// QRLoginDaemon generates QR, sends notification, spawns a background poll
-// daemon, and returns immediately. Designed for agent/bot invocations where
-// the caller cannot block for 5 minutes.
+// QRLoginDaemon generates QR, sends notification, and starts a background
+// goroutine (same process) to poll for QR confirmation. Returns QR info
+// immediately. The caller should keep the process alive by waiting on the
+// returned channel.
 //
-// Returns a map with QR info on success, or an error map.
-func (am *AuthManager) QRLoginDaemon() map[string]interface{} {
+// Returns (result map, done channel). The done channel is closed when the
+// background polling completes (success or failure).
+func (am *AuthManager) QRLoginDaemon() (map[string]interface{}, <-chan struct{}) {
+	logDebug("=== QRLoginDaemon START (daemon mode) ===")
+	done := make(chan struct{})
 	notify := loadNotifyConfig()
 	client := newHTTPClient()
 	sessionCookies := make(map[string]string)
@@ -43,23 +37,29 @@ func (am *AuthManager) QRLoginDaemon() map[string]interface{} {
 	resp, err := client.Do(req)
 	if err != nil {
 		notify.sendText("闲鱼登录失败：初始化会话失败")
-		return map[string]interface{}{"status": "error", "message": "初始化会话失败: " + err.Error()}
+		close(done)
+		return map[string]interface{}{"status": "error", "message": "初始化会话失败: " + err.Error()}, done
 	}
 	collectSetCookies(resp, sessionCookies)
 	resp.Body.Close()
+	logDebug("Step1 cookies=%d, keys=%v", len(sessionCookies), cookieKeys(sessionCookies))
 
 	// Step 2: Get login page parameters
 	loginParams := am.getLoginParams(client, sessionCookies)
 	if loginParams == nil {
 		notify.sendText("闲鱼登录失败：获取登录参数失败")
-		return map[string]interface{}{"status": "error", "message": "获取登录参数失败"}
+		close(done)
+		return map[string]interface{}{"status": "error", "message": "获取登录参数失败"}, done
 	}
+	logDebug("Step2 loginParams keys=%v", paramKeys(loginParams))
+	logDebug("Step2 cookies=%d, keys=%v", len(sessionCookies), cookieKeys(sessionCookies))
 
 	// Step 3: Generate QR code
 	qrData := am.generateQR(client, loginParams)
 	if qrData == nil {
 		notify.sendText("闲鱼登录失败：生成二维码失败")
-		return map[string]interface{}{"status": "error", "message": "生成二维码失败"}
+		close(done)
+		return map[string]interface{}{"status": "error", "message": "生成二维码失败"}, done
 	}
 
 	qrContent, _ := qrData["codeContent"].(string)
@@ -70,299 +70,98 @@ func (am *AuthManager) QRLoginDaemon() map[string]interface{} {
 		loginParams["ck"] = jsonValToStr(ck)
 	}
 
-	// Ensure the state/QR directory exists before writing any files
-	os.MkdirAll(daemonStateDir, 0755)
+	// Ensure the QR directory exists
+	os.MkdirAll(qrImageDir, 0755)
 
-	// Save QR image with unique name per attempt
-	qrPath := SaveQRImage(qrContent, filepath.Join(daemonStateDir, fmt.Sprintf("login_qr_%d.png", time.Now().UnixNano())))
+	// Save QR image
+	qrPath := SaveQRImage(qrContent, filepath.Join(qrImageDir, fmt.Sprintf("login_qr_%d.png", time.Now().UnixNano())))
 	if qrPath == "" {
 		notify.sendText("闲鱼登录失败：保存二维码图片失败")
-		return map[string]interface{}{"status": "error", "message": "保存二维码图片失败"}
+		close(done)
+		return map[string]interface{}{"status": "error", "message": "保存二维码图片失败"}, done
 	}
 
-	// Serialize state for the poll daemon (unique file per attempt)
-	state := daemonState{
-		LoginParams:    loginParams,
-		SessionCookies: sessionCookies,
-		QRContent:      qrContent,
-		QRPath:         qrPath,
-		CreatedAt:      time.Now().Unix(),
-	}
-	stateData, _ := json.Marshal(state)
-	stateFile := filepath.Join(daemonStateDir, fmt.Sprintf("login_state_%d.json", time.Now().UnixNano()))
-	if err := os.WriteFile(stateFile, stateData, 0600); err != nil {
-		notify.sendText("闲鱼登录失败：无法写入状态文件")
-		return map[string]interface{}{"status": "error", "message": "写入状态文件失败: " + err.Error()}
-	}
+	// Start background polling IMMEDIATELY — do NOT block on notification
+	// first. The server may flag sessions where polling starts too late
+	// after QR generation (risk control / iframeRedirect).
+	go func() {
+		defer close(done)
+		defer os.Remove(qrPath) // clean up QR image when done
 
-	// Spawn the poll daemon as a detached background process
-	selfBin, _ := os.Executable()
-	if selfBin == "" {
-		selfBin = "xianyu"
-	}
-	daemonCmd := exec.Command(selfBin, "login-poll", stateFile)
-	setSetsid(daemonCmd)
-	// Redirect daemon stdio to log file (or /dev/null if unavailable)
-	// to ensure the child never inherits the caller's pipes/TTY.
-	logFile, err := os.OpenFile("/tmp/xianyu_login_daemon.log", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
-	if err != nil {
-		logFile, _ = os.OpenFile(os.DevNull, os.O_WRONLY, 0)
-	}
-	daemonCmd.Stdout = logFile
-	daemonCmd.Stderr = logFile
-	daemonCmd.Stdin = nil
+		logDebug("Daemon goroutine started, polling for QR confirmation...")
 
-	if err := daemonCmd.Start(); err != nil {
-		os.Remove(stateFile) // Clean up state file on failure
-		notify.sendText("闲鱼登录失败：无法启动后台轮询")
-		return map[string]interface{}{"status": "error", "message": "启动后台轮询失败: " + err.Error()}
-	}
+		// Reuse the same pollQRStatusWithNotify as the synchronous path
+		resultCookies, confirmedResp := am.pollQRStatusWithNotify(client, loginParams, sessionCookies, notify)
+		if resultCookies == nil {
+			logDebug("Daemon: poll returned nil, login failed/expired")
+			return
+		}
 
-	// Detach — don't wait for the child
-	go func() { daemonCmd.Wait() }()
+		// Merge cookies
+		for k, v := range resultCookies {
+			sessionCookies[k] = v
+		}
+		logDebug("Daemon: after merge, sessionCookies=%d, keys=%v", len(sessionCookies), cookieKeys(sessionCookies))
 
-	// Send QR only AFTER daemon is confirmed running
-	notify.sendQR(qrPath)
+		// Extract user_id from s_tag
+		if sessionCookies["unb"] == "" && confirmedResp != nil {
+			sTag := confirmedResp.Header.Get("s_tag")
+			logDebug("Daemon: unb missing, s_tag=%q", sTag)
+			if uid := extractUserIDFromSTag(confirmedResp); uid != "" {
+				sessionCookies["unb"] = uid
+				logDebug("Daemon: extracted unb=%s from s_tag", uid)
+			}
+		}
 
-	log.Printf("Daemon spawned (PID %d), state file: %s", daemonCmd.Process.Pid, stateFile)
+		// Refresh token with retry
+		logDebug("Daemon: refreshing token...")
+		if !refreshMH5TKWithRetry(sessionCookies) {
+			logDebug("Daemon: token refresh failed")
+			notify.sendText("闲鱼登录失败：刷新 token 失败，请重新登录。")
+			return
+		}
+		logDebug("Daemon: token refreshed, cookies=%d, unb=%q", len(sessionCookies), sessionCookies["unb"])
+
+		// Save credential
+		userID := resolveUserID(sessionCookies, confirmedResp)
+		logDebug("Daemon: resolveUserID returned %q", userID)
+		cred := utils.NewCredential(sessionCookies, "qr-login")
+		cred.UserID = userID
+		if err := utils.SaveCredential(cred); err != nil {
+			log.Printf("Failed to save credential: %s", err)
+			notify.sendText("闲鱼登录失败：保存凭证失败")
+			return
+		}
+
+		hasTK := cred.MH5TK() != ""
+		hasUNB := userID != ""
+
+		if hasTK && hasUNB {
+			log.Printf("Login complete: user_id=%s, cookies=%d", userID, len(sessionCookies))
+			notify.sendText(fmt.Sprintf("闲鱼登录成功！用户ID: %s", userID))
+		} else if hasTK {
+			log.Printf("Login degraded: no user_id, cookies=%d", len(sessionCookies))
+			notify.sendText("闲鱼登录成功！（用户ID暂时未获取，不影响正常使用）")
+		} else {
+			log.Printf("Login failed: no token")
+			notify.sendText("闲鱼登录失败：未获取到有效 token，请重试。")
+		}
+	}()
+
+	// Send QR notification asynchronously — must not block polling
+	go func() {
+		notify.sendQR(qrPath)
+	}()
 
 	return map[string]interface{}{
-		"status":    "qr_ready",
-		"message":   "二维码已生成并发送，后台正在等待扫码确认",
-		"qr_path":   qrPath,
-		"qr_url":    qrContent,
-		"daemon_pid": daemonCmd.Process.Pid,
-	}
+		"status":  "qr_ready",
+		"message": "二维码已生成并发送，后台正在等待扫码确认",
+		"qr_path": qrPath,
+		"qr_url":  qrContent,
+	}, done
 }
 
-// RunPollDaemon is the entry point for the background poll daemon process.
-// It reads state from the given file, polls for QR confirmation, saves
-// credential, and sends notifications. This runs as a detached process.
-func RunPollDaemon(stateFile string) {
-	log.SetOutput(os.Stderr)
-	log.SetFlags(log.Ltime | log.Lshortfile)
-	log.Printf("Poll daemon started, state file: %s", stateFile)
-
-	notify := loadNotifyConfig()
-
-	// Read state
-	data, err := os.ReadFile(stateFile)
-	if err != nil {
-		log.Printf("Failed to read state file: %s", err)
-		notify.sendText("闲鱼登录失败：后台轮询无法读取状态")
-		cleanup(stateFile)
-		return
-	}
-	var state daemonState
-	if err := json.Unmarshal(data, &state); err != nil {
-		log.Printf("Failed to parse state file: %s", err)
-		notify.sendText("闲鱼登录失败：状态文件格式错误")
-		cleanup(stateFile)
-		return
-	}
-
-	// Check if state is too old (QR expires in 5 minutes)
-	if time.Now().Unix()-state.CreatedAt > 330 {
-		log.Printf("State too old, QR already expired")
-		notify.sendText("闲鱼登录二维码已过期，请重新发起登录。")
-		cleanup(stateFile)
-		return
-	}
-
-	// Create HTTP client and poll
-	client := newHTTPClient()
-
-	resultCookies, confirmedResp := pollQRStatusDaemon(client, state.LoginParams, state.SessionCookies, notify)
-	if resultCookies == nil {
-		cleanup(stateFile)
-		return
-	}
-
-	// Merge cookies
-	sessionCookies := state.SessionCookies
-	for k, v := range resultCookies {
-		sessionCookies[k] = v
-	}
-
-	// Extract user_id from s_tag
-	if sessionCookies["unb"] == "" && confirmedResp != nil {
-		if uid := extractUserIDFromSTag(confirmedResp); uid != "" {
-			sessionCookies["unb"] = uid
-			log.Printf("Extracted unb=%s from s_tag header", uid)
-		}
-	}
-
-	// Refresh token with retry
-	log.Printf("Refreshing token...")
-	if !refreshMH5TKWithRetry(sessionCookies) {
-		log.Printf("Token refresh failed")
-		notify.sendText("闲鱼登录失败：刷新 token 失败，请重新登录。")
-		cleanup(stateFile)
-		return
-	}
-	log.Printf("Token refreshed successfully")
-
-	// Save credential immediately with whatever we have
-	userID := resolveUserID(sessionCookies, confirmedResp)
-	cred := utils.NewCredential(sessionCookies, "qr-login")
-	cred.UserID = userID
-	if err := utils.SaveCredential(cred); err != nil {
-		log.Printf("Failed to save credential: %s", err)
-		notify.sendText("闲鱼登录失败：保存凭证失败")
-		cleanup(stateFile)
-		return
-	}
-
-	// Validate: require both _m_h5_tk and unb for full success
-	hasTK := cred.MH5TK() != ""
-	hasUNB := userID != ""
-
-	// If we have token but no user_id, retry with delay to avoid rate limiting
-	if hasTK && !hasUNB {
-		log.Printf("Login has token but no user_id, retrying after cooldown...")
-		time.Sleep(5 * time.Second)
-		userID = resolveUserID(sessionCookies, confirmedResp)
-		if userID != "" {
-			hasUNB = true
-			cred.UserID = userID
-			if err := utils.SaveCredential(cred); err != nil {
-				log.Printf("Failed to update credential with user_id: %s", err)
-			} else {
-				log.Printf("Updated credential with recovered user_id=%s", userID)
-			}
-		}
-	}
-
-	if hasTK && hasUNB {
-		log.Printf("Login complete: user_id=%s, cookies=%d", userID, len(sessionCookies))
-		notify.sendText(fmt.Sprintf("闲鱼登录成功！用户ID: %s", userID))
-	} else if hasTK {
-		log.Printf("Login degraded: no user_id, cookies=%d", len(sessionCookies))
-		notify.sendText("闲鱼登录成功（用户ID未获取，部分功能可能受限）。建议在终端执行 xianyu login 获取完整状态。")
-	} else {
-		log.Printf("Login failed: no token")
-		notify.sendText("闲鱼登录失败：未获取到有效 token，请重试。")
-	}
-
-	cleanup(stateFile)
-}
-
-// pollQRStatusDaemon is the daemon version of QR polling — no terminal output,
-// only notifications and logging.
-func pollQRStatusDaemon(client *http.Client, loginParams map[string]string, cookies map[string]string, notify notifyConfig) (map[string]string, *http.Response) {
-	start := time.Now()
-	scanned := false
-	consecutiveErrors := 0
-
-	for time.Since(start) < qrTimeout {
-		time.Sleep(qrPollInterval)
-
-		formData := buildFormData(loginParams)
-		req, _ := newPostRequest(qrQueryURL, formData)
-		req.Header.Set("Cookie", utils.BuildCookieHeader(cookies))
-
-		resp, err := client.Do(req)
-		if err != nil {
-			consecutiveErrors++
-			if consecutiveErrors >= 10 {
-				log.Printf("Too many consecutive errors: %s", err)
-				notify.sendText("闲鱼登录失败：网络错误过多")
-				return nil, nil
-			}
-			continue
-		}
-		consecutiveErrors = 0
-
-		data, status := parseQRPollResponse(resp)
-		if data == nil {
-			resp.Body.Close()
-			continue
-		}
-
-		switch status {
-		case "NEW":
-			resp.Body.Close()
-		case "SCANED", "SCANNED":
-			if !scanned {
-				scanned = true
-				log.Printf("QR scanned")
-				notify.sendText("已扫码，请在闲鱼 App 上确认登录。")
-			}
-			resp.Body.Close()
-		case "CONFIRMED":
-			log.Printf("QR confirmed")
-			resultCookies := make(map[string]string)
-			collectSetCookies(resp, resultCookies)
-
-			if token, ok := data["token"].(string); ok {
-				resultCookies["token"] = token
-			}
-			for _, key := range []string{"unb", "userId", "userid", "uid", "tbUserId", "loginId", "nick", "nickname"} {
-				if v, ok := data[key]; ok && v != nil && fmt.Sprint(v) != "" {
-					resultCookies[key] = fmt.Sprint(v)
-				}
-			}
-			// Also check nested loginResult/bizExt for user_id
-			for _, nested := range []string{"loginResult", "bizExt"} {
-				if sub, ok := data[nested].(map[string]interface{}); ok {
-					for _, key := range []string{"userId", "userid", "uid", "tbUserId", "loginId"} {
-						if v, ok := sub[key]; ok && v != nil && fmt.Sprint(v) != "" {
-							if resultCookies["unb"] == "" {
-								resultCookies["unb"] = fmt.Sprint(v)
-								log.Printf("Extracted unb=%s from %s.%s", fmt.Sprint(v), nested, key)
-							}
-						}
-					}
-				}
-			}
-
-			// Follow returnUrl using jar client to capture redirect cookies
-			if returnURL, ok := data["returnUrl"].(string); ok && returnURL != "" {
-				merged := mergeMaps(cookies, resultCookies)
-				jarClient := newJarClient(merged, returnURL)
-				redirectReq, _ := newGetRequest(returnURL)
-				redirectResp, err := jarClient.Do(redirectReq)
-				if err == nil {
-					collectSetCookies(redirectResp, resultCookies)
-					redirectResp.Body.Close()
-				}
-				drainJarCookies(jarClient, resultCookies, returnURL)
-			}
-			return resultCookies, resp
-
-		case "EXPIRED":
-			resp.Body.Close()
-			log.Printf("QR expired")
-			notify.sendText("闲鱼登录二维码已过期，请重新发起登录。")
-			return nil, nil
-		case "CANCELLED", "CANCELED":
-			resp.Body.Close()
-			log.Printf("QR cancelled")
-			notify.sendText("闲鱼登录已取消。")
-			return nil, nil
-		default:
-			resp.Body.Close()
-		}
-
-		// Check for risk control
-		if iframeRedirect, ok := data["iframeRedirect"].(bool); ok && iframeRedirect {
-			redirectURL, _ := data["iframeRedirectUrl"].(string)
-			msg := "闲鱼登录需要风控验证。"
-			if redirectURL != "" {
-				msg += " 验证链接: " + redirectURL
-			}
-			log.Printf("Risk control triggered: %s", redirectURL)
-			notify.sendText(msg)
-			return nil, nil
-		}
-	}
-
-	log.Printf("QR poll timed out")
-	notify.sendText("闲鱼登录等待超时，请重试。")
-	return nil, nil
-}
-
-// Helper functions to reduce duplication
+// Helper functions
 
 func newGetRequest(url string) (*http.Request, error) {
 	req, err := http.NewRequest("GET", url, nil)
@@ -410,28 +209,4 @@ func mergeMaps(base, overlay map[string]string) map[string]string {
 		merged[k] = v
 	}
 	return merged
-}
-
-func cleanup(stateFile string) {
-	// Only remove files that live under the daemon state directory
-	absState, _ := filepath.Abs(stateFile)
-	absDir, _ := filepath.Abs(daemonStateDir)
-	if !strings.HasPrefix(absState, absDir+string(filepath.Separator)) {
-		log.Printf("Refusing to clean up file outside daemon dir: %s", stateFile)
-		return
-	}
-
-	// Also clean up the associated QR image if it exists under the same dir
-	data, err := os.ReadFile(stateFile)
-	if err == nil {
-		var state daemonState
-		if json.Unmarshal(data, &state) == nil && state.QRPath != "" {
-			absQR, _ := filepath.Abs(state.QRPath)
-			if strings.HasPrefix(absQR, absDir+string(filepath.Separator)) {
-				os.Remove(state.QRPath)
-			}
-		}
-	}
-	os.Remove(stateFile)
-	log.Printf("Cleaned up state file: %s", stateFile)
 }
