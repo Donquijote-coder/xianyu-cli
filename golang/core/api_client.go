@@ -210,7 +210,7 @@ func (c *GoofishApiClient) parseResponse(body map[string]interface{}) (map[strin
 
 	// Check for token expiry
 	for _, r := range ret {
-		if strings.Contains(r, "TOKEN_EXOIRED") || strings.Contains(r, "TOKEN_EXPIRED") || strings.Contains(r, "FAIL_SYS_TOKEN") {
+		if strings.Contains(r, "TOKEN_EXOIRED") || strings.Contains(r, "TOKEN_EXPIRED") || strings.Contains(r, "FAIL_SYS_TOKEN") || strings.Contains(r, "SESSION_EXPIRED") {
 			return nil, &TokenExpiredError{ApiError{Message: "Token expired: " + retStr, Ret: ret}}
 		}
 	}

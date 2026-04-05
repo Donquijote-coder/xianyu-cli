@@ -371,44 +371,84 @@ func (ws *GoofishWebSocket) SendMessage(conversationID, toUserID, text, itemID s
 
 // ListConversations returns the conversation list.
 func (ws *GoofishWebSocket) ListConversations() []map[string]interface{} {
-	mid := generateMID()
-	msg := map[string]interface{}{
-		"lwp":     "/r/Conversation/listNewestPagination",
-		"headers": map[string]interface{}{"mid": mid},
-		"body":    []map[string]interface{}{{"pageSize": 50}},
-	}
-	ws.writeJSON(msg)
+	// Drain all pending messages from the initial sync and parse them
+	deadline := time.Now().Add(15 * time.Second)
+	var allParsed []map[string]interface{}
 
-	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) {
 		remaining := time.Until(deadline)
-		raw, err := ws.readNext(remaining)
-		if err != nil || raw == nil {
+		if remaining <= 0 {
 			break
 		}
+		raw, err := ws.readNext(remaining)
+		if err != nil || raw == nil {
+			continue
+		}
+
 		var respData map[string]interface{}
 		if json.Unmarshal(raw, &respData) != nil {
 			continue
 		}
 		lwp, _ := respData["lwp"].(string)
-		if lwp == "/s/sync" || lwp == "/s/para" || lwp == "/s/vulcan" || lwp == "/!" {
+		if lwp == "/!" {
 			continue
 		}
-		log.Printf("[ListConv] response lwp=%s code=%s", lwp, respCode(respData))
+
+		// Parse sync/vulcan pushes
+		parsed := ws.parsePushMessages(raw)
+		allParsed = append(allParsed, parsed...)
+
+		// Also check for conversation data in body
 		body, _ := respData["body"].(map[string]interface{})
-		convs, _ := body["conversations"].([]interface{})
-		if len(convs) > 0 {
-			var result []map[string]interface{}
-			for _, c := range convs {
-				if m, ok := c.(map[string]interface{}); ok {
-					result = append(result, m)
+		if body != nil {
+			convs, _ := body["conversations"].([]interface{})
+			if len(convs) > 0 {
+				for _, c := range convs {
+					if m, ok := c.(map[string]interface{}); ok {
+						allParsed = append(allParsed, m)
+					}
 				}
 			}
-			return result
+		}
+
+		// Check syncPushPackage items
+		spp := ws.extractSyncPushPackage(respData)
+		if spp != nil && len(spp) > 0 {
+			log.Printf("[ListConv] Got syncPushPackage with %d items", len(spp))
+			// Try to parse items
+			for _, item := range spp {
+				decoded := ws.decodeSPPItem(item)
+				if decoded != nil {
+					allParsed = append(allParsed, decoded)
+				}
+			}
 		}
 	}
-	return nil
+
+	log.Printf("[ListConv] Parsed %d total items", len(allParsed))
+	return allParsed
 }
+
+// extractSyncPushPackage extracts items from a vulcan sync push.
+func (ws *GoofishWebSocket) extractSyncPushPackage(resp map[string]interface{}) []map[string]interface{} {
+	body, _ := resp["body"].(map[string]interface{})
+	if body == nil {
+		return nil
+	}
+	spp, _ := body["syncPushPackage"].(map[string]interface{})
+	if spp == nil {
+		return nil
+	}
+	items, _ := spp["items"].([]interface{})
+	var result []map[string]interface{}
+	for _, item := range items {
+		if m, ok := item.(map[string]interface{}); ok {
+			result = append(result, m)
+		}
+	}
+	return result
+}
+
 
 // Watch watches for incoming messages in real-time.
 func (ws *GoofishWebSocket) Watch(onMessage func(map[string]interface{}), timeout time.Duration) {
@@ -592,6 +632,7 @@ func (ws *GoofishWebSocket) heartbeatLoop() {
 
 // ── Message parsing ──
 
+
 func (ws *GoofishWebSocket) decodeSPPItem(item map[string]interface{}) map[string]interface{} {
 	rawData, _ := item["data"].(string)
 	if rawData == "" {
@@ -599,6 +640,38 @@ func (ws *GoofishWebSocket) decodeSPPItem(item map[string]interface{}) map[strin
 	}
 	biz, _ := item["bizType"].(float64)
 	obj, _ := item["objectType"].(float64)
+
+	// biz=370: conversation/session sync data
+	if int(biz) == 370 {
+		// Try to decode biz=370 data (conversation info)
+		for _, enc := range []*base64.Encoding{
+			base64.StdEncoding,
+			base64.RawStdEncoding,
+			base64.URLEncoding,
+			base64.RawURLEncoding,
+		} {
+			rawBytes, b64err := enc.DecodeString(rawData)
+			if b64err != nil {
+				continue
+			}
+			// Try JSON first
+			var unpacked map[string]interface{}
+			if json.Unmarshal(rawBytes, &unpacked) == nil {
+				log.Printf("[decodeSPP] biz=370 obj=%d decoded as JSON, keys=%v", int(obj), mapKeys(unpacked))
+				return unpacked
+			}
+			// Try msgpack
+			decoder := NewMessagePackDecoder(rawBytes)
+			val, decErr := decoder.DecodeValue()
+			if decErr == nil {
+				if m, ok := val.(map[string]interface{}); ok {
+					log.Printf("[decodeSPP] biz=370 obj=%d decoded as msgpack, keys=%v", int(obj), mapKeys(m))
+					return m
+				}
+			}
+		}
+		return nil
+	}
 
 	// biz=40: chat-related messages (obj=40000 direct msg, obj=40006 session arouse, etc.)
 	if int(biz) == 40 {

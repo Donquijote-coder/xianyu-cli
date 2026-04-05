@@ -31,7 +31,7 @@ var msgListCmd = &cobra.Command{
 		if cred == nil {
 			return
 		}
-		result, err := core.RunAPICall(cred, "mtop.taobao.idle.trade.pc.message.headinfo", map[string]interface{}{})
+		result, err := core.RunAPICall(cred, "mtop.idle.trade.pc.message.headinfo", map[string]interface{}{})
 		if err != nil {
 			handleAPIError(err)
 			return
@@ -58,7 +58,7 @@ var msgReadCmd = &cobra.Command{
 		if cred == nil {
 			return
 		}
-		result, err := core.RunAPICall(cred, "mtop.taobao.idle.trade.pc.message.list",
+		result, err := core.RunAPICall(cred, "mtop.idle.trade.pc.message.list",
 			map[string]interface{}{"conversationId": args[0], "pageSize": 50})
 		if err != nil {
 			handleAPIError(err)
@@ -443,7 +443,7 @@ func CollectReplies(cred *utils.Credential, sellerIDs []string, timeout, lookbac
 func fallbackFetchReplies(cred *utils.Credential, targetSellerIDs map[string]bool) []map[string]interface{} {
 	log.Printf("[HTTP兜底] 尝试补获 %d 个未回复卖家的消息", len(targetSellerIDs))
 
-	headInfo, err := core.RunAPICall(cred, "mtop.taobao.idle.trade.pc.message.headinfo", map[string]interface{}{})
+	headInfo, err := core.RunAPICall(cred, "mtop.idle.trade.pc.message.headinfo", map[string]interface{}{})
 	if err != nil {
 		log.Printf("[HTTP兜底] 获取会话列表失败: %v", err)
 		return nil
