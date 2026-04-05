@@ -104,6 +104,27 @@ export XIANYU_PROXY_URL="http://<username>:<password>@<host>:<port>"
 
 **要求：** 支持 HTTPS CONNECT 隧道 + HTTP Basic Auth。建议使用住宅代理 IP 降低风控。
 
+### OpenClaw 环境下的代理配置
+
+通过 OpenClaw gateway 调用 xianyu 命令时，exec 进程不会加载 `~/.bashrc`，导致 `XIANYU_PROXY_URL` 缺失。如果服务器 IP 被闲鱼识别为海外地区，登录时会触发风控验证（`iframeRedirect`）。需要在以下两处确保代理变量可用：
+
+**1. `~/.openclaw/.env`**
+
+OpenClaw 启动时会加载此文件中的环境变量，确保所有 exec 子进程继承：
+
+```bash
+# ~/.openclaw/.env
+XIANYU_PROXY_URL=http://<username>:<password>@<host>:<port>
+```
+
+**2. `xianyu_exec.sh` wrapper 脚本**
+
+作为兜底，wrapper 脚本中设置默认值，防止环境变量缺失：
+
+```bash
+export XIANYU_PROXY_URL="${XIANYU_PROXY_URL:-http://<username>:<password>@<host>:<port>}"
+```
+
 ## 功能
 
 - **认证**: QR码登录、浏览器Cookie提取、凭证持久化
