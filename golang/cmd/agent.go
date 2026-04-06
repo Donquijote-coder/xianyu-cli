@@ -1,9 +1,13 @@
 package cmd
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
+	"os/signal"
 	"strings"
+	"sync"
+	"syscall"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -195,13 +199,64 @@ func runAgentFlow(cred *utils.Credential, keyword, inquiry string, top, timeout 
 	}
 	fmt.Fprintf(os.Stderr, "%s\n", utils.Dim.Sprintf("  成功 %d 条 · 失败 %d 条", len(sentItems), len(broadcastResult["failed"].([]map[string]interface{}))))
 
-	// Step 3: Collect
+	// Step 3: Collect (runs in background goroutine so SIGTERM doesn't kill analysis)
 	fmt.Fprintf(os.Stderr, "%s 等待卖家回复（最长 %ds）...\n", utils.Cyan.Sprint("Step 3/5"), timeout)
-	collectResult := CollectReplies(cred, sentSellerIDs, timeout, 0, ws)
 
-	replies, _ := collectResult["replies"].([]map[string]interface{})
-	noReply, _ := collectResult["no_reply"].([]string)
-	fmt.Fprintf(os.Stderr, "%s\n", utils.Dim.Sprintf("  收到 %d 条回复 · %d 个未回复 · 耗时 %vs", len(replies), len(noReply), collectResult["duration_seconds"]))
+	// Use a temp file + wait group so goroutine result survives SIGTERM
+	tmpFile, _ := os.CreateTemp("", "xianyu_collect_*.json")
+	tmpFile.Write([]byte(`{"replies":[],"no_reply":[],"timeout_reached":false,"duration_seconds":0}`))
+	tmpFile.Close()
+	tmpPath := tmpFile.Name()
+
+	var wg sync.WaitGroup
+	var collectMu sync.Mutex
+	var collectResult map[string]interface{} = map[string]interface{}{
+		"replies": []map[string]interface{}{}, "no_reply": []string{},
+		"timeout_reached": false, "duration_seconds": 0,
+	}
+	sigTermReceived := false
+
+	// SIGTERM handler: sets flag, closes WS to interrupt collect goroutine
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGTERM)
+	defer signal.Stop(sigCh)
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		// Run collect in isolated scope so SIGTERM only affects ws read
+		result := CollectReplies(cred, sentSellerIDs, timeout, 0, ws)
+		collectMu.Lock()
+		collectResult = result
+		collectMu.Unlock()
+		// Write to temp file as backup
+		data, _ := json.Marshal(result)
+		os.WriteFile(tmpPath, data, 0644)
+	}()
+
+	// Wait for either collect done or SIGTERM
+	select {
+	case <-sigCh:
+		sigTermReceived = true
+		fmt.Fprintf(os.Stderr, "%s\n", utils.Yellow.Sprint("\n[SIGTERM] 等待被中断，保留已收到的回复继续分析..."))
+		ws.Close() // interrupt the goroutine's WS read
+		wg.Wait()   // wait for goroutine to flush
+	case <-time.After(time.Duration(timeout+10) * time.Second):
+		// Should not reach here normally; safety net
+	}
+
+	// Read final result
+	collectMu.Lock()
+	finalResult := collectResult
+	collectMu.Unlock()
+	os.Remove(tmpPath) // clean up
+
+	replies, _ := finalResult["replies"].([]map[string]interface{})
+	noReply, _ := finalResult["no_reply"].([]string)
+	if sigTermReceived {
+		finalResult["timeout_reached"] = true
+	}
+	fmt.Fprintf(os.Stderr, "%s\n", utils.Dim.Sprintf("  收到 %d 条回复 · %d 个未回复 · 耗时 %vs", len(replies), len(noReply), finalResult["duration_seconds"]))
 
 	// Step 4: AI Analysis
 	fmt.Fprintf(os.Stderr, "%s AI 分析中...\n", utils.Cyan.Sprint("Step 4/5"))
@@ -228,7 +283,7 @@ func runAgentFlow(cred *utils.Credential, keyword, inquiry string, top, timeout 
 
 	return map[string]interface{}{
 		"keyword": keyword, "inquiry": inquiry, "search_results": sellersInfo,
-		"broadcast": broadcastResult, "collect": collectResult, "analysis": analysis,
+		"broadcast": broadcastResult, "collect": finalResult, "analysis": analysis,
 	}
 }
 
